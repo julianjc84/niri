@@ -180,12 +180,26 @@ This section is explicitly opinionated. Each choice is labeled with its reasonin
 **Why:**
 - **Modifier combos come for free.** `Mod+TouchSwipe fingers=3 direction="up"` reuses the existing key-bind parser with no new code paths — modifiers are stripped off the node name before property parsing begins.
 - **One lookup path.** `find_configured_bind()` handles every input type identically. `Trigger::TouchSwipe { fingers, direction }` is a struct variant, so `Eq`/`Hash` still work; bind lookup is unchanged from the hardcoded design.
-- **Consistency with niri's existing model.** Niri's keyboard and mouse binds already live in `binds {}`, and all other bind attributes (`natural-scroll=`, `sensitivity=`, `cooldown-ms=`) are KDL properties. Hardcoding finger count into the *node name* was the one place where touch gestures diverged from the rest of the config grammar; this closes that gap.
+- **Consistency with niri's existing model.** Niri's keyboard and mouse binds already live in `binds {}`, and all other bind attributes (`tag=`, `natural-scroll=`, `sensitivity=`, `cooldown-ms=`) are KDL properties. Hardcoding finger count into the *node name* was the one place where touch gestures diverged from the rest of the config grammar; this closes that gap.
 - **Arbitrary finger counts.** `fingers=N` accepts any integer in `3..=10`. Users with tablets and large multitouch displays that report 6–10 contacts can bind to them without an enum change on the compositor side. The `3..=10` range is enforced by the parser with a clear error on out-of-range values.
 - **Per-family validation.** Each family has its own legal direction vocabulary (swipe takes `up/down/left/right`, pinch takes `in/out`, rotate takes `cw/ccw`, edge takes `left/right/top/bottom` with optional `zone=`). Invalid combinations are rejected at parse time, not at runtime.
 - **Hard break from the old syntax.** The previous enum-per-combination design (`TouchSwipe3Up`, `TouchEdgeTop:Left`) is gone — no dual-parse, no deprecation aliasing. A cleaner config grammar is worth the one-time migration cost for a pre-1.0 feature with a small user base.
 
-### 5.3 `touchscreen-gesture-passthrough` window rule
+### 5.3 Tag property + IPC gesture events
+
+**What:** Gesture binds can carry an optional `tag="name"` property. Tagged binds emit `GestureBegin` / `GestureProgress` / `GestureEnd` events on niri's existing IPC event stream, letting external tools observe gestures for custom animations or UI feedback.
+
+**Why:**
+- **External extensibility without a scripting runtime.** niri doesn't need to embed Lua or JavaScript; tools subscribe to IPC events and react.
+- **Security-scoped.** Only tagged gesture binds emit IPC events. Keyboard input never appears in the event stream. This is a deliberate scoping decision — "we expose gestures because they're low-frequency, high-intent user actions, but we don't expose every keystroke."
+- **Three distinct modes.** With tags + the `noop` action, niri supports:
+  1. **Observe** — `tag="ws"` + real action: niri runs the action and emits IPC events for external UI feedback
+  2. **IPC-only** — `tag="drawer"` + `noop`: niri captures the gesture purely for IPC, runs no compositor action
+  3. **Plain** — no tag: niri runs the action, no IPC emission
+- **Both discrete and continuous noop are supported.** A tagged `noop` bind on a swipe or pinch drives the full begin/update/end lifecycle, emitting continuous `GestureProgress` events for external animations — external tools can draw finger-tracked UI without the compositor performing any action of its own.
+- **Enables `niri-tag-sidebar` and similar tools** to build gesture-driven UIs without having to reimplement touch recognition themselves.
+
+### 5.4 `touchscreen-gesture-passthrough` window rule
 
 **What:** A window-rule bool field. When set on a matching window, niri's recognizer stays out of the way for touches that start on that window — events forward raw to the client for the lifetime of the gesture.
 
@@ -195,7 +209,7 @@ This section is explicitly opinionated. Each choice is labeled with its reasonin
 - **Doesn't wait for a Wayland protocol that isn't coming.** The reviewer who raised this concern ([issue discussion]) explicitly acknowledged the "elaborate automatic" version feels bad; this ships the blunt-but-predictable alternative now.
 - **Discoverability via `RUST_LOG=niri=debug`.** When niri captures a gesture, it logs the app-id of the window under the touch, letting users see exactly which app-id to add to their passthrough rules.
 
-### 5.4 Escape hatches: Mod+touch and edge zones always bypass passthrough
+### 5.5 Escape hatches: Mod+touch and edge zones always bypass passthrough
 
 **What:** Even on a window with `touchscreen-gesture-passthrough true`, holding the mod key or starting a touch in a screen-edge zone still triggers compositor gestures.
 
@@ -204,7 +218,7 @@ This section is explicitly opinionated. Each choice is labeled with its reasonin
 - **Edge detection runs before window lookup.** This isn't a special case — edge zones are already evaluated before the window is even checked, so passthrough is automatically excluded.
 - **Mod+ is an explicit user intent signal.** If the user holds the mod key, they are unambiguously asking for a compositor action. Passthrough is for implicit gestures; Mod+ is explicit, so it wins.
 
-### 5.5 Per-edge zoned triggers
+### 5.6 Per-edge zoned triggers
 
 **What:** Each screen edge is split into thirds along its perpendicular axis. `TouchEdge` accepts an optional `zone=` property — `edge="top" zone="left"`, etc. — giving 12 zoned triggers in addition to the 4 unzoned parents. Zoned triggers fall back to the parent if not configured. The zone vocabulary rotates per edge: `top`/`bottom` edges take `left|center|right`; `left`/`right` edges take `top|center|bottom`. Mismatched vocabularies are a parse error.
 
@@ -212,8 +226,9 @@ This section is explicitly opinionated. Each choice is labeled with its reasonin
 - **12 + 4 = 16 edge actions possible** without adding a new concept; power users can bind distinct actions per edge zone.
 - **Parent fallback.** A bare `TouchEdge edge="top"` catches any top-edge swipe that doesn't land in a more specific zoned bind, so adding one zoned bind doesn't break the others.
 - **Matches real-world UI patterns.** Status bars, notification shades, and app drawers all want *different* actions for different parts of the same edge.
+- **Matching UI support in external tooling.** `niri-tag-sidebar` mirrors the zone model so tagged panels can anchor to specific zones.
 
-### 5.6 Touchpad via `wp_pointer_gestures_v1` (libinput)
+### 5.7 Touchpad via `wp_pointer_gestures_v1` (libinput)
 
 **What:** Touchpad gestures are read from libinput via smithay's existing plumbing, exposed through the same `binds {}` block with `TouchpadSwipe fingers=N direction="..."` triggers. No compositor-side recognition.
 
@@ -287,9 +302,35 @@ This is intentionally narrower than a full capability-negotiation protocol. It d
 - The discoverability debug log becomes less important because correct behavior is automatic for participating apps.
 - Niri would be one of the first compositors to support such a protocol if one is drafted.
 
-### 7.2 Touchpad gesture passthrough (sibling rule)
+### 7.2 Unify IPC progress with niri's internal commit threshold
+
+IPC `GestureProgress` events already carry a normalized `progress: f64` (computed as `accumulated_delta * sensitivity / gesture-progress-distance`), so external consumers *do* get a 0→1 value. The unresolved problem is that niri has **two independent threshold systems** that are not synchronized:
+
+1. **IPC progress** — the value external tools see, driven by configured `gesture-progress-distance`
+2. **Internal compositor commit** — niri's layout code decides whether to snap to the next workspace / column / overview state based on its own distance and velocity math
+
+These two can disagree. A swipe can reach IPC `progress = 0.8` while niri decides to snap back, or commit when IPC `progress = 0.3`. For external UIs driven by tagged gestures, this mismatch is visible — a progress bar showing 80% while niri snaps back feels broken.
+
+The improvement is to either (a) expose niri's internal progress alongside or instead of the IPC progress, or (b) make the IPC progress drive the commit decision so the two always agree. See `GESTURE_PROGRESS_MISMATCH.md` for the full write-up.
+
+In practice the touchscreen case tracks closer than touchpad because screen pixels match niri's internal units, while libinput's acceleration-curved touchpad deltas make the touchpad mismatch more noticeable.
+
+### 7.3 Touchpad gesture passthrough (sibling rule)
 
 For completeness, a `touchpad-gesture-passthrough` window rule could be added. The shape is different — touchpad has no "window under finger," so the rule would match the focused window instead — but the config surface would look analogous. Punted from v1 because the pain is smaller (2-finger touchpad gestures already forward by default via libinput) and the semantics need more thought.
+
+### 7.4 Have `GestureEnd { completed }` reflect internal commit, not just cancellation
+
+The `completed` field on `GestureEnd` currently distinguishes two cases:
+
+- `completed: true` — gesture ended normally (all fingers lifted without external interruption)
+- `completed: false` — gesture was cancelled (a new finger arrived and restarted recognition, or cleanup fired)
+
+What it does **not** distinguish: whether niri's internal threshold actually committed the bound action. A touch workspace swipe that ends with all fingers lifted emits `completed: true` regardless of whether the compositor snapped forward to the new workspace or snapped back to the original. For tagged gestures driving external UIs, this is the same mismatch as §7.2 — the IPC event doesn't know what niri actually did.
+
+The fix is the same as §7.2: either unify the threshold systems so the answer is always knowable, or add a separate `action_committed: bool` field that propagates niri's internal snap decision. Either way, external tools should be able to answer "did the swipe actually do the thing?" from the `GestureEnd` event alone.
+
+---
 
 ## 8. Open questions
 
@@ -311,7 +352,11 @@ Currently yes, hard-coded. A case could be made for a `touchscreen-gesture-passt
 
 Current behavior: once the first finger decides passthrough on touch-down, the entire gesture stays in passthrough mode until all fingers lift, even if fingers move off the window. This avoids confusing mid-gesture handoffs, but it means a user who accidentally starts a gesture on a passthrough window can't rescue it onto the compositor by dragging away. Reversing the policy (mid-gesture handoff based on current position) is probably worse, but this is the trade-off.
 
-### 8.5 Should the debug log be promoted to `info` or stay at `debug`?
+### 8.5 Continuous `noop` semantics
+
+If we add continuous noop (section 7.2), should the delta stream be raw pixels, normalized progress, or both? Raw is more flexible but forces external tools to do their own normalization. Normalized is easier to consume but loses information. Both means more IPC traffic. No decision yet.
+
+### 8.6 Should the debug log be promoted to `info` or stay at `debug`?
 
 The `touch: captured N-finger gesture over app-id=X` log line is currently at `debug` level. That means it requires `RUST_LOG=niri=debug` to see. Promoting it to `info` would surface it by default, which helps discoverability but adds noise to logs during normal use. Leaning toward leaving it at `debug` and documenting the `RUST_LOG` requirement, but open to arguments.
 

@@ -16,6 +16,12 @@
 //! The compositor infers whether an action is continuous (drives an
 //! animation that tracks the finger) or discrete (fires once).
 //!
+//! IPC gesture events:
+//!   Tagged binds (`tag="name"`) emit GestureBegin/Progress/End events
+//!   on the IPC event stream, allowing external tools to observe or
+//!   drive custom animations. The `noop` action consumes a gesture
+//!   for IPC without triggering any compositor action.
+//!
 //! Note on Mod+touch: On touchscreens, touch serves double duty as
 //! both click and gesture input. Mod+touch triggers window move/resize
 //! grabs (hardcoded), so Mod+Touch* gesture binds can conflict with
@@ -30,6 +36,7 @@ use niri_config::binds::{
 use niri_config::input::{EdgeZone, FocusOnTouch, ScreenEdge};
 use niri_config::touch_binds::{continuous_gesture_kind, ContinuousGestureKind, TouchGestureType};
 use niri_config::Action;
+use niri_ipc::GestureDelta;
 use smithay::backend::input::{Event as _, TouchEvent};
 use smithay::input::touch::{
     DownEvent, GrabStartData as TouchGrabStartData, MotionEvent as TouchMotionEvent, UpEvent,
@@ -49,13 +56,25 @@ use crate::utils::with_toplevel_role;
 const TOUCH_DEFAULT_SENSITIVITY: f64 = 0.4;
 
 /// Extract gesture info from a matched bind: continuous kind, sensitivity,
-/// natural scroll, and action.
+/// natural scroll, tag, and action.
 fn extract_bind_info(
     bind: niri_config::Bind,
-) -> (Option<ContinuousGestureKind>, f64, bool, Action) {
+) -> (
+    Option<ContinuousGestureKind>,
+    f64,
+    bool,
+    Option<String>,
+    Action,
+) {
     let kind = continuous_gesture_kind(&bind.action);
     let sensitivity = bind.sensitivity.unwrap_or(TOUCH_DEFAULT_SENSITIVITY);
-    (kind, sensitivity, bind.natural_scroll, bind.action)
+    (
+        kind,
+        sensitivity,
+        bind.natural_scroll,
+        bind.tag,
+        bind.action,
+    )
 }
 
 impl State {
@@ -86,11 +105,22 @@ impl State {
                     self.niri.touch_gesture_points.len(),
                 );
                 // Unlock: end current gesture animations, restart recognition.
+                // If the gesture being interrupted was tagged, emit GestureEnd
+                // with completed=false — a consumer that received GestureBegin
+                // is contractually owed a matching GestureEnd even when the
+                // gesture is cancelled by a new finger landing.
                 self.niri.touch_gesture_locked = false;
-                self.niri.touch_active_bind = None;
+                let cancelled_tag = self
+                    .niri
+                    .touch_active_bind
+                    .take()
+                    .and_then(ActiveTouchBind::into_tag);
                 self.niri.layout.workspace_switch_gesture_end(Some(false));
                 self.niri.layout.view_offset_gesture_end(Some(false));
                 self.niri.layout.overview_gesture_end();
+                if let Some(tag) = cancelled_tag {
+                    self.ipc_gesture_end(tag, false);
+                }
             }
             self.niri.touch_gesture_cumulative = Some((0., 0.));
             if self.niri.touch_gesture_points.len() >= 3 {
@@ -439,11 +469,16 @@ impl State {
                         self.niri.touch_edge_swipe = None;
                     }
                 }
-                TouchEdgeSwipeState::Active { kind, .. } => {
+                TouchEdgeSwipeState::Active { kind, tag, .. } => {
                     let kind = *kind;
+                    let tag = tag.clone();
                     self.niri.touch_edge_swipe = None;
                     // End the gesture animation.
                     end_continuous_gesture(self, kind);
+                    // Emit IPC GestureEnd for tagged edge swipe.
+                    if let Some(tag) = tag {
+                        self.ipc_gesture_end(tag, true);
+                    }
                     self.niri.touch_gesture_points.remove(&Some(slot));
                     return;
                 }
@@ -473,12 +508,20 @@ impl State {
         //
         // Fix: rebase `last_spread` to the post-removal spread so the next
         // motion event computes `incremental ≈ 0` across the
-        // discontinuity.
+        // discontinuity. Shift `start_spread` by the same delta so the IPC
+        // absolute offset `(current - start)` stays continuous for
+        // tagged consumers.
         if self.niri.touch_gesture_locked {
-            if let Some(ActiveTouchBind::Pinch { last_spread, .. }) =
-                self.niri.touch_active_bind.as_mut()
+            if let Some(ActiveTouchBind::Pinch {
+                start_spread,
+                last_spread,
+                ..
+            }) = self.niri.touch_active_bind.as_mut()
             {
-                *last_spread = calculate_spread(&self.niri.touch_gesture_points);
+                let new_spread = calculate_spread(&self.niri.touch_gesture_points);
+                let shift = new_spread - *last_spread;
+                *last_spread = new_spread;
+                *start_spread += shift;
             }
         }
 
@@ -494,7 +537,11 @@ impl State {
         //
         // Fix: overwrite `previous_angles` with fresh angles taken against
         // the post-removal centroid. No delta is accumulated for this step;
-        // the next real motion event starts fresh.
+        // the next real motion event starts fresh. Because `ipc_progress`
+        // for rotation is computed as
+        // `(cumulative_rotation - start_rotation) / progress_distance`,
+        // leaving both values untouched keeps the IPC progress continuous
+        // across the discontinuity with no need for a compensating shift.
         //
         // This rebase applies whether the active bind is Rotate (mid-gesture
         // finger lift of an active rotation) OR another variant (unlocked
@@ -520,7 +567,7 @@ impl State {
         // post-removal geometry so `spread_change` resets to zero across
         // the discontinuity. Only applies while unlocked — once a pinch
         // is already active the rebase above (at the `ActiveTouchBind::Pinch`
-        // branch) handles the locked case.
+        // branch) handles the locked case with continuous IPC progress.
         if !self.niri.touch_gesture_points.is_empty()
             && !self.niri.touch_gesture_locked
             && self.niri.touch_gesture_points.len() >= 3
@@ -559,9 +606,19 @@ impl State {
                             elapsed_ms,
                         );
                         if let Some(bind) = bind_info {
+                            let tag = bind.tag.clone();
+                            let trigger_name = format!("TouchTap fingers={}", tap.peak_fingers,);
+                            // Emit GestureBegin + immediate GestureEnd for IPC.
+                            self.ipc_gesture_begin(
+                                tag.clone().unwrap_or_default(),
+                                trigger_name,
+                                tap.peak_fingers,
+                                false,
+                            );
                             if !matches!(bind.action, Action::Noop) {
                                 self.do_action(bind.action, false);
                             }
+                            self.ipc_gesture_end(tag.unwrap_or_default(), true);
                         }
                     } else {
                         tracing::debug!(
@@ -580,7 +637,12 @@ impl State {
             self.niri.touch_frame_dirty = false;
             self.niri.touch_frame_delta = (0., 0.);
             self.niri.touch_frame_edge_delta = (0., 0.);
-            self.niri.touch_active_bind = None;
+            // Take the active bind to get the tag before clearing.
+            // We track `had_active` separately so we can emit GestureEnd
+            // even for untagged binds (debug tools rely on it).
+            let active_bind = self.niri.touch_active_bind.take();
+            let had_active = active_bind.is_some();
+            let active_tag = active_bind.and_then(ActiveTouchBind::into_tag);
             self.niri.touch_gesture_initial_spread = None;
             self.niri.touch_gesture_cumulative_rotation = 0.0;
             self.niri.touch_gesture_previous_angles.clear();
@@ -603,6 +665,12 @@ impl State {
                 self.niri.queue_redraw(&output);
             }
             self.niri.layout.overview_gesture_end();
+
+            // Emit IPC GestureEnd for every committed multi-finger
+            // gesture, tagged or not — empty tag for untagged binds.
+            if had_active {
+                self.ipc_gesture_end(active_tag.unwrap_or_default(), true);
+            }
         }
 
         if let Some(capture) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
@@ -781,7 +849,7 @@ impl State {
                             None
                         };
 
-                        if let Some(((kind, sensitivity, natural_scroll, action), trigger)) =
+                        if let Some(((kind, sensitivity, natural_scroll, tag, action), trigger)) =
                             bind_info
                         {
                             tracing::debug!(
@@ -799,16 +867,29 @@ impl State {
                             let handle = self.niri.seat.get_touch().unwrap();
                             handle.cancel(self);
 
+                            let trigger_name = trigger_to_ipc_name(trigger);
+                            self.ipc_gesture_begin(
+                                tag.clone().unwrap_or_default(),
+                                trigger_name,
+                                peak_fingers,
+                                kind.is_some(),
+                            );
+
                             if let Some(kind) = kind {
                                 begin_continuous_gesture(self, kind, pos);
                                 let active = ActiveTouchBind::Swipe {
                                     kind,
                                     sensitivity,
                                     natural_scroll,
+                                    tag,
+                                    ipc_progress: 0.0,
                                 };
                                 self.niri.touch_active_bind = Some(active);
-                            } else if !matches!(action, Action::Noop) {
-                                self.do_action(action, false);
+                            } else {
+                                if !matches!(action, Action::Noop) {
+                                    self.do_action(action, false);
+                                }
+                                self.ipc_gesture_end(tag.clone().unwrap_or_default(), true);
                             }
                         } else {
                             tracing::debug!(
@@ -940,7 +1021,19 @@ impl State {
                             };
                             let bind_info = bind_info.map(extract_bind_info);
 
-                            if let Some((kind, sensitivity, natural_scroll, action)) = bind_info {
+                            if let Some((kind, sensitivity, natural_scroll, tag, action)) =
+                                bind_info
+                            {
+                                if let Some(ref tag) = tag {
+                                    let trigger_name = trigger_to_ipc_name(trigger);
+                                    self.ipc_gesture_begin(
+                                        tag.clone(),
+                                        trigger_name,
+                                        1,
+                                        kind.is_some(),
+                                    );
+                                }
+
                                 if let Some(kind) = kind {
                                     self.niri.touch_edge_swipe =
                                         Some(TouchEdgeSwipeState::Active {
@@ -951,6 +1044,8 @@ impl State {
                                             sensitivity,
                                             natural_scroll,
                                             slot: edge_slot,
+                                            tag,
+                                            ipc_progress: 0.0,
                                         });
                                     handle.cancel(self);
                                     begin_continuous_gesture(self, kind, pos);
@@ -959,6 +1054,9 @@ impl State {
                                     handle.cancel(self);
                                     if !matches!(action, Action::Noop) {
                                         self.do_action(action, false);
+                                    }
+                                    if let Some(ref tag) = tag {
+                                        self.ipc_gesture_end(tag.clone(), true);
                                     }
                                     self.niri.touch_edge_swipe = None;
                                 }
@@ -971,11 +1069,13 @@ impl State {
                         kind,
                         sensitivity,
                         natural_scroll,
+                        tag,
                         ..
                     } => {
                         let kind = *kind;
                         let sensitivity = *sensitivity;
                         let natural = *natural_scroll;
+                        let tag = tag.clone();
                         // Use edge-slot-only delta, not the combined
                         // multi-finger delta.
                         let (edge_dx, edge_dy) = self.niri.touch_frame_edge_delta;
@@ -989,6 +1089,7 @@ impl State {
                                 sensitivity,
                                 natural,
                                 timestamp,
+                                tag: tag.as_deref(),
                             },
                         );
                     }
@@ -1006,10 +1107,13 @@ impl State {
                             kind,
                             sensitivity,
                             natural_scroll,
+                            tag,
+                            ..
                         } => {
                             let kind = *kind;
                             let sensitivity = *sensitivity;
                             let natural = *natural_scroll;
+                            let tag = tag.clone();
                             feed_continuous_gesture(
                                 self,
                                 ContinuousGestureUpdate {
@@ -1019,16 +1123,19 @@ impl State {
                                     sensitivity,
                                     natural,
                                     timestamp,
+                                    tag: tag.as_deref(),
                                 },
                             );
                         }
-                        ActiveTouchBind::Pinch { kind, .. } => {
+                        ActiveTouchBind::Pinch { kind, tag, .. } => {
                             let kind = *kind;
-                            feed_continuous_pinch(self, kind, timestamp);
+                            let tag = tag.clone();
+                            feed_continuous_pinch(self, kind, timestamp, tag.as_deref());
                         }
-                        ActiveTouchBind::Rotate { kind } => {
+                        ActiveTouchBind::Rotate { kind, tag, .. } => {
                             let kind = *kind;
-                            feed_continuous_rotation(self, kind, timestamp);
+                            let tag = tag.clone();
+                            feed_continuous_rotation(self, kind, timestamp, tag.as_deref());
                         }
                     }
                 } else if let Some((cx, cy)) = &mut self.niri.touch_gesture_cumulative {
@@ -1110,6 +1217,23 @@ impl State {
                         is_rotate, is_pinch, closest,
                     );
 
+                    #[cfg(debug_assertions)]
+                    self.ipc_recognition_frame(
+                        finger_count as u8,
+                        swipe_distance,
+                        swipe_trigger,
+                        current_spread - initial_spread,
+                        pinch_trigger,
+                        cumulative_rotation,
+                        rotation_trigger,
+                        rotation_arc,
+                        rotation_arc_trigger_distance,
+                        is_rotate,
+                        is_pinch,
+                        closest.to_string(),
+                        timestamp.as_millis() as u32,
+                    );
+
                     let rotation_candidate =
                         finger_count >= 3 && rotation_arc >= rotation_arc_trigger_distance;
 
@@ -1182,36 +1306,61 @@ impl State {
                         let bind_info = bind_info.map(extract_bind_info);
 
                         {
-                            let trigger =
-                                touch_gesture_to_trigger(gesture_type, finger_count as u8);
-                            let (bind_matched, kind_str) = match bind_info.as_ref() {
-                                Some((kind, _, _, _)) => (
+                            let trigger_name =
+                                touch_gesture_to_trigger(gesture_type, finger_count as u8)
+                                    .map(trigger_to_ipc_name)
+                                    .unwrap_or_else(|| "Unknown".to_string());
+                            let (bind_matched, kind_str, tag_str) = match bind_info.as_ref() {
+                                Some((kind, _, _, tag, _)) => (
                                     "yes",
                                     kind.map(|k| format!("{:?}", k))
                                         .unwrap_or_else(|| "discrete".to_string()),
+                                    tag.clone().unwrap_or_else(|| "-".to_string()),
                                 ),
-                                None => ("no", "-".to_string()),
+                                None => ("no", "-".to_string(), "-".to_string()),
                             };
                             tracing::debug!(
                                 target: "niri::input::touch_gesture",
                                 "TOUCH-DBG LOCK fingers={} type={:?} \
-                                 trigger={:?} bind={} kind={}",
+                                 trigger={} bind={} kind={} tag={}",
                                 finger_count,
                                 gesture_type,
-                                trigger,
+                                trigger_name,
                                 bind_matched,
                                 kind_str,
+                                tag_str,
                             );
                         }
 
-                        if let Some((kind, sensitivity, natural_scroll, action)) = bind_info {
+                        if let Some((kind, sensitivity, natural_scroll, tag, action)) = bind_info {
+                            {
+                                let trigger_name =
+                                    touch_gesture_to_trigger(gesture_type, finger_count as u8)
+                                        .map(trigger_to_ipc_name)
+                                        .unwrap_or_else(|| "Unknown".to_string());
+                                self.ipc_gesture_begin(
+                                    tag.clone().unwrap_or_default(),
+                                    trigger_name,
+                                    finger_count as u8,
+                                    kind.is_some(),
+                                );
+                            }
+
                             if let Some(kind) = kind {
                                 begin_continuous_gesture(self, kind, pos);
                                 let active = if is_rotate {
-                                    ActiveTouchBind::Rotate { kind }
+                                    ActiveTouchBind::Rotate {
+                                        kind,
+                                        tag,
+                                        ipc_progress: 0.0,
+                                        start_rotation: cumulative_rotation,
+                                    }
                                 } else if is_pinch {
                                     ActiveTouchBind::Pinch {
                                         kind,
+                                        tag,
+                                        ipc_progress: 0.0,
+                                        start_spread: current_spread,
                                         last_spread: current_spread,
                                     }
                                 } else {
@@ -1219,11 +1368,16 @@ impl State {
                                         kind,
                                         sensitivity,
                                         natural_scroll,
+                                        tag,
+                                        ipc_progress: 0.0,
                                     }
                                 };
                                 self.niri.touch_active_bind = Some(active);
-                            } else if !matches!(action, Action::Noop) {
-                                self.do_action(action, false);
+                            } else {
+                                if !matches!(action, Action::Noop) {
+                                    self.do_action(action, false);
+                                }
+                                self.ipc_gesture_end(tag.clone().unwrap_or_default(), true);
                             }
                         }
                     }
@@ -1248,8 +1402,18 @@ impl State {
             self.niri.touch_edge_swipe.is_some(),
         );
 
+        // Collect tags for IPC GestureEnd before clearing state.
+        // Track `had_active` separately so we can emit a cancelled
+        // GestureEnd for untagged multi-finger binds too.
+        let active_bind = self.niri.touch_active_bind.take();
+        let had_active = active_bind.is_some();
+        let active_tag = active_bind.and_then(ActiveTouchBind::into_tag);
+        let edge_tag = match &self.niri.touch_edge_swipe {
+            Some(TouchEdgeSwipeState::Active { tag, .. }) => tag.clone(),
+            _ => None,
+        };
+
         // Clear all touch gesture state.
-        self.niri.touch_active_bind = None;
         self.niri.touch_gesture_points.clear();
         self.niri.touch_gesture_cumulative = None;
         self.niri.touch_edge_swipe = None;
@@ -1269,6 +1433,15 @@ impl State {
         self.niri.layout.workspace_switch_gesture_end(Some(false));
         self.niri.layout.view_offset_gesture_end(Some(false));
         self.niri.layout.overview_gesture_end();
+
+        // Emit IPC GestureEnd (cancelled) for any committed multi-finger
+        // bind (tagged or untagged), and tagged edge swipes.
+        if had_active {
+            self.ipc_gesture_end(active_tag.unwrap_or_default(), false);
+        }
+        if let Some(tag) = edge_tag {
+            self.ipc_gesture_end(tag, false);
+        }
 
         handle.cancel(self);
     }
@@ -1445,13 +1618,14 @@ fn begin_continuous_gesture(
 }
 
 /// Parameters describing a single continuous-gesture motion update.
-struct ContinuousGestureUpdate {
+struct ContinuousGestureUpdate<'a> {
     kind: ContinuousGestureKind,
     delta_x: f64,
     delta_y: f64,
     sensitivity: f64,
     natural: bool,
     timestamp: Duration,
+    tag: Option<&'a str>,
 }
 
 /// Feed delta to an active continuous gesture.
@@ -1463,7 +1637,14 @@ fn feed_continuous_gesture(state: &mut State, update: ContinuousGestureUpdate) {
         sensitivity,
         natural,
         timestamp,
+        tag,
     } = update;
+    // Compute progress: accumulate the adjusted (post-sensitivity, post-natural)
+    // primary axis delta. gesture-pixel-distance px ≈ 1 unit.
+    let progress_unit = {
+        let config = state.niri.config.borrow();
+        config.input.touchscreen.swipe_progress_distance()
+    };
 
     match kind {
         ContinuousGestureKind::WorkspaceSwitch => {
@@ -1501,8 +1682,65 @@ fn feed_continuous_gesture(state: &mut State, update: ContinuousGestureUpdate) {
             }
         }
         ContinuousGestureKind::Noop => {
-            // No compositor animation.
+            // No compositor animation — IPC progress is emitted below.
         }
+    }
+
+    // Emit IPC GestureProgress if this bind has a tag.
+    if let Some(tag) = tag {
+        // Compute adjusted delta for progress accumulation.
+        let adjusted_delta = match kind {
+            ContinuousGestureKind::WorkspaceSwitch | ContinuousGestureKind::OverviewToggle => {
+                let dy = if natural { -delta_y } else { delta_y };
+                dy * sensitivity
+            }
+            ContinuousGestureKind::ViewScroll => {
+                let dx = if natural { -delta_x } else { delta_x };
+                dx * sensitivity
+            }
+            ContinuousGestureKind::Noop => {
+                // Use the dominant axis
+                let dy = if natural { -delta_y } else { delta_y };
+                let dx = if natural { -delta_x } else { delta_x };
+                if dy.abs() > dx.abs() {
+                    dy * sensitivity
+                } else {
+                    dx * sensitivity
+                }
+            }
+        };
+
+        // Update accumulated progress on the active Swipe bind or edge swipe.
+        // Pinches take the `feed_continuous_pinch` path and never reach here.
+        let progress = if let Some(ActiveTouchBind::Swipe { ipc_progress, .. }) =
+            state.niri.touch_active_bind.as_mut()
+        {
+            *ipc_progress += adjusted_delta / progress_unit;
+            *ipc_progress
+        } else if let Some(TouchEdgeSwipeState::Active {
+            ref mut ipc_progress,
+            ..
+        }) = state.niri.touch_edge_swipe
+        {
+            *ipc_progress += adjusted_delta / progress_unit;
+            *ipc_progress
+        } else {
+            // Fallback: no accumulator reachable (shouldn't happen on the
+            // hot path — the caller populates one of the two state slots
+            // before calling here).
+            adjusted_delta / progress_unit
+        };
+
+        let ts_ms = timestamp.as_millis() as u32;
+        state.ipc_gesture_progress(
+            tag.to_string(),
+            progress,
+            GestureDelta::Swipe {
+                dx: delta_x,
+                dy: delta_y,
+            },
+            ts_ms,
+        );
     }
 }
 
@@ -1522,10 +1760,19 @@ fn feed_continuous_gesture(state: &mut State, update: ContinuousGestureUpdate) {
 /// scaling from linear swipe distances. At the default `1.0`, one pixel of
 /// spread change contributes one pixel to the underlying gesture
 /// accumulator, matching the scale swipes use.
-fn feed_continuous_pinch(state: &mut State, kind: ContinuousGestureKind, timestamp: Duration) {
-    let pinch_sensitivity = {
+fn feed_continuous_pinch(
+    state: &mut State,
+    kind: ContinuousGestureKind,
+    timestamp: Duration,
+    tag: Option<&str>,
+) {
+    // Batch the two config reads so we only borrow RefCell once per call.
+    let (pinch_sensitivity, progress_unit) = {
         let config = state.niri.config.borrow();
-        config.input.touchscreen.pinch_sensitivity()
+        (
+            config.input.touchscreen.pinch_sensitivity(),
+            config.input.touchscreen.pinch_progress_distance(),
+        )
     };
 
     let current_spread = calculate_spread(&state.niri.touch_gesture_points);
@@ -1533,12 +1780,17 @@ fn feed_continuous_pinch(state: &mut State, kind: ContinuousGestureKind, timesta
     // Destructure the active Pinch variant directly. If the active bind is
     // anything else (or None), something is badly wrong with the dispatch in
     // on_touch_motion — bail out cleanly rather than panic.
-    let Some(ActiveTouchBind::Pinch { last_spread, .. }) = state.niri.touch_active_bind.as_mut()
+    let Some(ActiveTouchBind::Pinch {
+        start_spread,
+        last_spread,
+        ..
+    }) = state.niri.touch_active_bind.as_mut()
     else {
         return;
     };
     let incremental = current_spread - *last_spread;
     *last_spread = current_spread;
+    let start_spread = *start_spread;
 
     match kind {
         ContinuousGestureKind::OverviewToggle => {
@@ -1574,8 +1826,31 @@ fn feed_continuous_pinch(state: &mut State, kind: ContinuousGestureKind, timesta
             }
         }
         ContinuousGestureKind::Noop => {
-            // No compositor animation.
+            // No compositor animation — IPC progress is emitted below.
         }
+    }
+
+    // Emit IPC GestureProgress for tagged pinch binds.
+    if let Some(tag) = tag {
+        // Signed, unbounded: positive = pinch-out, negative = pinch-in.
+        // Unlike swipes, pinch progress is absolute (computed from start_spread
+        // each frame) rather than accumulated — reversing the pinch gives a
+        // direct inverse, with no drift from accumulated float error.
+        let progress = (current_spread - start_spread) / progress_unit;
+        if let Some(ActiveTouchBind::Pinch { ipc_progress, .. }) =
+            state.niri.touch_active_bind.as_mut()
+        {
+            *ipc_progress = progress;
+        }
+        let ts_ms = timestamp.as_millis() as u32;
+        state.ipc_gesture_progress(
+            tag.to_string(),
+            progress,
+            GestureDelta::Pinch {
+                d_spread: incremental,
+            },
+            ts_ms,
+        );
     }
 }
 
@@ -1592,10 +1867,19 @@ fn feed_continuous_pinch(state: &mut State, kind: ContinuousGestureKind, timesta
 /// `pinch_sensitivity` (same knob as pinch — rotation shares the "radial
 /// gesture" category). For OverviewToggle, CCW opens the overview to mirror
 /// the pinch-in → open convention (both are "gather inward" motions).
-fn feed_continuous_rotation(state: &mut State, kind: ContinuousGestureKind, timestamp: Duration) {
-    let pinch_sensitivity = {
+fn feed_continuous_rotation(
+    state: &mut State,
+    kind: ContinuousGestureKind,
+    timestamp: Duration,
+    tag: Option<&str>,
+) {
+    // Batch config reads to hold the RefCell once per call.
+    let (pinch_sensitivity, rotation_progress_angle) = {
         let config = state.niri.config.borrow();
-        config.input.touchscreen.pinch_sensitivity()
+        (
+            config.input.touchscreen.pinch_sensitivity(),
+            config.input.touchscreen.rotation_progress_angle(),
+        )
     };
 
     // Compute this frame's angular delta and update the previous-angle basis.
@@ -1605,6 +1889,16 @@ fn feed_continuous_rotation(state: &mut State, kind: ContinuousGestureKind, time
     );
     state.niri.touch_gesture_previous_angles = new_angles;
     state.niri.touch_gesture_cumulative_rotation += frame_rotation;
+    let cumulative_rotation = state.niri.touch_gesture_cumulative_rotation;
+
+    // Destructure the active Rotate variant to read its start_rotation;
+    // bail if misdispatched.
+    let Some(ActiveTouchBind::Rotate { start_rotation, .. }) =
+        state.niri.touch_active_bind.as_ref()
+    else {
+        return;
+    };
+    let start_rotation = *start_rotation;
 
     // Convert angular motion to an animation-accumulator scalar. Arc length
     // at a unit radius is the angular delta itself; scale by pinch_sensitivity
@@ -1649,8 +1943,32 @@ fn feed_continuous_rotation(state: &mut State, kind: ContinuousGestureKind, time
             }
         }
         ContinuousGestureKind::Noop => {
-            // No compositor animation.
+            // No compositor animation — IPC progress is emitted below.
         }
+    }
+
+    // Emit IPC GestureProgress for tagged rotation binds.
+    if let Some(tag) = tag {
+        // Signed, unbounded: positive = CCW, negative = CW. Progress is the
+        // rotation since recognition, normalized by the progress distance.
+        // `cumulative_rotation - start_rotation` keeps the running metric
+        // out of the progress math so the recognition-phase rotation isn't
+        // included in the animation drive.
+        let progress = (cumulative_rotation - start_rotation) / rotation_progress_angle;
+        if let Some(ActiveTouchBind::Rotate { ipc_progress, .. }) =
+            state.niri.touch_active_bind.as_mut()
+        {
+            *ipc_progress = progress;
+        }
+        let ts_ms = timestamp.as_millis() as u32;
+        state.ipc_gesture_progress(
+            tag.to_string(),
+            progress,
+            GestureDelta::Rotate {
+                d_radians: frame_rotation,
+            },
+            ts_ms,
+        );
     }
 }
 
@@ -1801,6 +2119,106 @@ fn calculate_rotation_delta(
     let avg = sum / count as f64;
     let filtered = if avg.abs() < NOISE_FLOOR { 0.0 } else { avg };
     (filtered, new_angles)
+}
+
+/// Convert a gesture Trigger to its KDL config name for IPC events. The
+/// emitted string echoes the same property form users write in `binds {}`
+/// (e.g. `TouchSwipe fingers=3 direction="up"`) so IPC consumers can
+/// string-match against their own config 1:1. Non-gesture variants fall
+/// through to `"Unknown"` — this function is only meant for gesture
+/// triggers.
+pub(crate) fn trigger_to_ipc_name(trigger: Trigger) -> String {
+    match trigger {
+        Trigger::TouchSwipe { fingers, direction } => {
+            format!(
+                "TouchSwipe fingers={fingers} direction=\"{}\"",
+                swipe_dir_name(direction)
+            )
+        }
+        Trigger::TouchpadSwipe { fingers, direction } => {
+            format!(
+                "TouchpadSwipe fingers={fingers} direction=\"{}\"",
+                swipe_dir_name(direction)
+            )
+        }
+        Trigger::TouchPinch { fingers, direction } => {
+            format!(
+                "TouchPinch fingers={fingers} direction=\"{}\"",
+                pinch_dir_name(direction)
+            )
+        }
+        Trigger::TouchpadPinch { fingers, direction } => {
+            format!(
+                "TouchpadPinch fingers={fingers} direction=\"{}\"",
+                pinch_dir_name(direction)
+            )
+        }
+        Trigger::TouchRotate { fingers, direction } => {
+            format!(
+                "TouchRotate fingers={fingers} direction=\"{}\"",
+                rotate_dir_name(direction)
+            )
+        }
+        Trigger::TouchTap { fingers } => {
+            format!("TouchTap fingers={fingers}")
+        }
+        Trigger::TouchpadTapHold { fingers } => {
+            format!("TouchpadTapHold fingers={fingers}")
+        }
+        Trigger::TouchpadTapHoldDrag { fingers } => {
+            format!("TouchpadTapHoldDrag fingers={fingers}")
+        }
+        Trigger::TouchTapHoldDrag { fingers, direction } => match direction {
+            Some(d) => format!(
+                "TouchTapHoldDrag fingers={fingers} direction=\"{}\"",
+                swipe_dir_name(d)
+            ),
+            None => format!("TouchTapHoldDrag fingers={fingers}"),
+        },
+        Trigger::TouchEdge { edge, zone } => {
+            let edge_str = edge.as_kdl_name();
+            match zone {
+                None => format!("TouchEdge edge=\"{edge_str}\""),
+                Some(z) => format!(
+                    "TouchEdge edge=\"{edge_str}\" zone=\"{}\"",
+                    niri_config::input::zone_kdl_name(edge, z)
+                ),
+            }
+        }
+        // Every current caller only passes gesture triggers. If that
+        // invariant ever breaks we want to hear about it loudly in dev
+        // rather than silently emitting "Unknown" into the IPC stream.
+        other => {
+            debug_assert!(
+                false,
+                "trigger_to_ipc_name called with non-gesture trigger: {other:?}"
+            );
+            "Unknown".to_string()
+        }
+    }
+}
+
+fn swipe_dir_name(d: SwipeDirection) -> &'static str {
+    match d {
+        SwipeDirection::Up => "up",
+        SwipeDirection::Down => "down",
+        SwipeDirection::Left => "left",
+        SwipeDirection::Right => "right",
+    }
+}
+
+fn pinch_dir_name(d: PinchDirection) -> &'static str {
+    match d {
+        PinchDirection::In => "in",
+        PinchDirection::Out => "out",
+    }
+}
+
+fn rotate_dir_name(d: RotateDirection) -> &'static str {
+    match d {
+        RotateDirection::Cw => "cw",
+        RotateDirection::Ccw => "ccw",
+    }
 }
 
 #[cfg(test)]

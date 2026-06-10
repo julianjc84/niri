@@ -16,7 +16,7 @@ use niri_config::{
     Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, PinchDirection,
     SwipeDirection, SwitchBinds, Trigger, MAX_FINGERS, MIN_FINGERS,
 };
-use niri_ipc::LayoutSwitchTarget;
+use niri_ipc::{GestureDelta, LayoutSwitchTarget};
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
     GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _,
@@ -3150,6 +3150,7 @@ impl State {
                                 hotkey_overlay_title: None,
                                 sensitivity: None,
                                 natural_scroll: false,
+                                tag: None,
                             });
                             let bind_right = Some(Bind {
                                 key: Key {
@@ -3164,6 +3165,7 @@ impl State {
                                 hotkey_overlay_title: None,
                                 sensitivity: None,
                                 natural_scroll: false,
+                                tag: None,
                             });
                             (bind_left, bind_right)
                         } else {
@@ -3223,6 +3225,7 @@ impl State {
                             hotkey_overlay_title: None,
                             sensitivity: None,
                             natural_scroll: false,
+                            tag: None,
                         });
                         let bind_down = Some(Bind {
                             key: Key {
@@ -3237,6 +3240,7 @@ impl State {
                             hotkey_overlay_title: None,
                             sensitivity: None,
                             natural_scroll: false,
+                            tag: None,
                         });
                         (bind_up, bind_down)
                     } else if should_handle_in_overview && modifiers == Modifiers::SHIFT {
@@ -3253,6 +3257,7 @@ impl State {
                             hotkey_overlay_title: None,
                             sensitivity: None,
                             natural_scroll: false,
+                            tag: None,
                         });
                         let bind_down = Some(Bind {
                             key: Key {
@@ -3267,6 +3272,7 @@ impl State {
                             hotkey_overlay_title: None,
                             sensitivity: None,
                             natural_scroll: false,
+                            tag: None,
                         });
                         (bind_up, bind_down)
                     } else {
@@ -3873,6 +3879,13 @@ impl State {
             if let Some(bind) = bind {
                 let kind = continuous_gesture_kind(&bind.action);
                 let sensitivity = bind.sensitivity.unwrap_or(TOUCHPAD_DEFAULT_SENSITIVITY);
+                let tag = bind.tag.clone();
+
+                // Emit IPC GestureBegin if tagged.
+                if let Some(ref tag) = tag {
+                    let trigger_name = crate::input::touch_gesture::trigger_to_ipc_name(trigger);
+                    self.ipc_gesture_begin(tag.clone(), trigger_name, drag_fingers, kind.is_some());
+                }
 
                 if let Some(kind) = kind {
                     // Continuous gesture — begin animation. Reuses the
@@ -3916,9 +3929,17 @@ impl State {
                             // No compositor animation.
                         }
                     }
-                    self.niri.gesture_swipe_bind = Some(ActiveSwipeBind { kind, sensitivity });
+                    self.niri.gesture_swipe_bind = Some(ActiveSwipeBind {
+                        kind,
+                        sensitivity,
+                        tag,
+                        ipc_progress: 0.0,
+                    });
                 } else {
                     // Discrete action — fire once.
+                    if let Some(ref tag) = tag {
+                        self.ipc_gesture_end(tag.clone(), true);
+                    }
                     self.do_action(bind.action, bind.allow_when_locked);
                 }
 
@@ -4019,6 +4040,19 @@ impl State {
                     if let Some(bind) = bind {
                         let kind = continuous_gesture_kind(&bind.action);
                         let sensitivity = bind.sensitivity.unwrap_or(TOUCHPAD_DEFAULT_SENSITIVITY);
+                        let tag = bind.tag.clone();
+
+                        // Emit IPC GestureBegin if this bind has a tag.
+                        if let Some(ref tag) = tag {
+                            let trigger_name =
+                                crate::input::touch_gesture::trigger_to_ipc_name(trigger);
+                            self.ipc_gesture_begin(
+                                tag.clone(),
+                                trigger_name,
+                                fingers as u8,
+                                kind.is_some(),
+                            );
+                        }
 
                         if let Some(kind) = kind {
                             // Continuous gesture — begin animation.
@@ -4064,12 +4098,20 @@ impl State {
                                     // No compositor animation.
                                 }
                             }
-                            self.niri.gesture_swipe_bind =
-                                Some(ActiveSwipeBind { kind, sensitivity });
+                            self.niri.gesture_swipe_bind = Some(ActiveSwipeBind {
+                                kind,
+                                sensitivity,
+                                tag,
+                                ipc_progress: 0.0,
+                            });
                         } else {
                             // Discrete action — fire once.
                             if !matches!(bind.action, Action::Noop) {
                                 self.handle_bind(bind);
+                            }
+                            // Emit immediate GestureEnd for discrete gestures.
+                            if let Some(ref tag) = tag {
+                                self.ipc_gesture_end(tag.clone(), true);
                             }
                         }
                         return;
@@ -4084,6 +4126,7 @@ impl State {
         if let Some(ref bind) = self.niri.gesture_swipe_bind {
             let kind = bind.kind;
             let sensitivity = bind.sensitivity;
+            let tag = bind.tag.clone();
             let mut handled = false;
             match kind {
                 ContinuousGestureKind::WorkspaceSwitch => {
@@ -4125,11 +4168,47 @@ impl State {
                     }
                 }
                 ContinuousGestureKind::Noop => {
-                    // No compositor animation.
+                    // No compositor animation — just emit IPC progress below.
                     handled = true;
                 }
             }
+            // Emit IPC GestureProgress for tagged touchpad gestures.
             if handled {
+                if let Some(tag) = tag {
+                    let progress_distance = {
+                        let config = self.niri.config.borrow();
+                        config.input.touchpad.swipe_progress_distance()
+                    };
+                    let adjusted_delta = match kind {
+                        ContinuousGestureKind::WorkspaceSwitch
+                        | ContinuousGestureKind::OverviewToggle => delta_y * sensitivity,
+                        ContinuousGestureKind::ViewScroll => delta_x * sensitivity,
+                        ContinuousGestureKind::Noop => {
+                            if delta_y.abs() > delta_x.abs() {
+                                delta_y * sensitivity
+                            } else {
+                                delta_x * sensitivity
+                            }
+                        }
+                    };
+                    let progress = match &mut self.niri.gesture_swipe_bind {
+                        Some(ref mut bind) => {
+                            bind.ipc_progress += adjusted_delta / progress_distance;
+                            bind.ipc_progress
+                        }
+                        None => 0.0,
+                    };
+                    let ts_ms = timestamp.as_millis() as u32;
+                    self.ipc_gesture_progress(
+                        tag,
+                        progress,
+                        GestureDelta::Swipe {
+                            dx: delta_x,
+                            dy: delta_y,
+                        },
+                        ts_ms,
+                    );
+                }
                 return;
             }
         }
@@ -4151,7 +4230,8 @@ impl State {
 
     fn on_gesture_swipe_end<I: InputBackend>(&mut self, event: I::GestureSwipeEndEvent) {
         self.niri.gesture_swipe_3f_cumulative = None;
-        self.niri.gesture_swipe_bind = None;
+        // Take the bind to extract the tag before clearing.
+        let swipe_tag = self.niri.gesture_swipe_bind.take().and_then(|b| b.tag);
 
         let mut handled = false;
         let res = self.niri.layout.workspace_switch_gesture_end(Some(true));
@@ -4170,6 +4250,11 @@ impl State {
         if res {
             self.niri.queue_redraw_all();
             handled = true;
+        }
+
+        // Emit IPC GestureEnd for tagged touchpad gestures.
+        if let Some(tag) = swipe_tag {
+            self.ipc_gesture_end(tag, true);
         }
 
         if handled {
@@ -4257,6 +4342,17 @@ impl State {
                     drop(config);
 
                     if let Some(bind) = bind {
+                        if let Some(ref tag) = bind.tag {
+                            let trigger_name =
+                                crate::input::touch_gesture::trigger_to_ipc_name(trigger);
+                            self.ipc_gesture_begin(
+                                tag.clone(),
+                                trigger_name,
+                                fingers,
+                                false, // discrete
+                            );
+                            self.ipc_gesture_end(tag.clone(), true);
+                        }
                         self.do_action(bind.action, bind.allow_when_locked);
                     }
                 }
@@ -4342,6 +4438,19 @@ impl State {
                 drop(config);
 
                 if let Some(bind) = bind {
+                    // Emit IPC GestureBegin + GestureEnd for tagged taps.
+                    if let Some(ref tag) = bind.tag {
+                        let trigger_name =
+                            crate::input::touch_gesture::trigger_to_ipc_name(trigger);
+                        self.ipc_gesture_begin(
+                            tag.clone(),
+                            trigger_name,
+                            fingers,
+                            false, // taps are always discrete
+                        );
+                        self.ipc_gesture_end(tag.clone(), true);
+                    }
+
                     self.do_action(bind.action, bind.allow_when_locked);
                 }
             }
@@ -4499,6 +4608,7 @@ fn should_intercept_key<'a>(
                     hotkey_overlay_title: None,
                     sensitivity: None,
                     natural_scroll: false,
+                    tag: None,
                 });
             }
         }
@@ -4567,6 +4677,7 @@ fn find_bind<'a>(
             hotkey_overlay_title: None,
             sensitivity: None,
             natural_scroll: false,
+            tag: None,
         });
     }
 
@@ -4807,6 +4918,7 @@ fn hardcoded_overview_bind(raw: Keysym, mods: ModifiersState) -> Option<Bind> {
         hotkey_overlay_title: None,
         sensitivity: None,
         natural_scroll: false,
+        tag: None,
     })
 }
 
@@ -5261,6 +5373,7 @@ mod tests {
             hotkey_overlay_title: None,
             sensitivity: None,
             natural_scroll: false,
+            tag: None,
         }]);
 
         let comp_mod = ModKey::Super;
@@ -5449,6 +5562,7 @@ mod tests {
                 hotkey_overlay_title: None,
                 sensitivity: None,
                 natural_scroll: false,
+                tag: None,
             },
             Bind {
                 key: Key {
@@ -5463,6 +5577,7 @@ mod tests {
                 hotkey_overlay_title: None,
                 sensitivity: None,
                 natural_scroll: false,
+                tag: None,
             },
             Bind {
                 key: Key {
@@ -5477,6 +5592,7 @@ mod tests {
                 hotkey_overlay_title: None,
                 sensitivity: None,
                 natural_scroll: false,
+                tag: None,
             },
             Bind {
                 key: Key {
@@ -5491,6 +5607,7 @@ mod tests {
                 hotkey_overlay_title: None,
                 sensitivity: None,
                 natural_scroll: false,
+                tag: None,
             },
             Bind {
                 key: Key {
@@ -5505,6 +5622,7 @@ mod tests {
                 hotkey_overlay_title: None,
                 sensitivity: None,
                 natural_scroll: false,
+                tag: None,
             },
         ]);
 

@@ -237,6 +237,10 @@ pub enum TouchEdgeSwipeState {
         sensitivity: f64,
         natural_scroll: bool,
         slot: Option<TouchSlot>,
+        /// IPC tag for gesture events.
+        tag: Option<String>,
+        /// Accumulated progress for IPC (0.0 = start, 1.0 = one unit).
+        ipc_progress: f64,
     },
 }
 
@@ -244,6 +248,10 @@ pub enum TouchEdgeSwipeState {
 pub struct ActiveSwipeBind {
     pub kind: ContinuousGestureKind,
     pub sensitivity: f64,
+    /// IPC tag for gesture events.
+    pub tag: Option<String>,
+    /// Accumulated progress for IPC (0.0 = start, 1.0 = one unit).
+    pub ipc_progress: f64,
 }
 
 /// State for an active multi-finger touch gesture (after bind matched).
@@ -258,9 +266,24 @@ pub enum ActiveTouchBind {
         kind: ContinuousGestureKind,
         sensitivity: f64,
         natural_scroll: bool,
+        /// IPC tag for gesture events.
+        tag: Option<String>,
+        /// Accumulated progress for IPC. Signed and unbounded — grows as the
+        /// finger moves in the recognized direction, goes negative on reversal,
+        /// and can exceed `±1.0` on overshoot.
+        ipc_progress: f64,
     },
     Pinch {
         kind: ContinuousGestureKind,
+        /// IPC tag for gesture events.
+        tag: Option<String>,
+        /// Absolute IPC progress — recomputed each feed frame as
+        /// `(current - start) / pinch_progress_distance`. Signed: positive
+        /// for pinch-out, negative for pinch-in. Non-monotonic: reversing
+        /// the pinch reverses the progress.
+        ipc_progress: f64,
+        /// Finger spread at the moment the pinch was recognized.
+        start_spread: f64,
         /// Finger spread at the previous motion event. Subtracted from the
         /// current spread to produce the incremental delta that drives the
         /// animation.
@@ -268,6 +291,21 @@ pub enum ActiveTouchBind {
     },
     Rotate {
         kind: ContinuousGestureKind,
+        /// IPC tag for gesture events.
+        tag: Option<String>,
+        /// IPC progress — recomputed each feed frame as
+        /// `(cumulative_rotation - start_rotation) / rotation_progress_distance`.
+        /// Signed: positive for CCW, negative for CW. Non-monotonic.
+        ipc_progress: f64,
+        /// Value of `touch_gesture_cumulative_rotation` at the moment the
+        /// gesture was recognized. Subtracted from the running cumulative to
+        /// produce the rotation *since recognition*, so the recognition-phase
+        /// rotation doesn't bleed into the animated progress. Unlike pinch's
+        /// absolute `current - start` comparison, the underlying metric must
+        /// accumulate per-frame because `atan2` wraps at ±π and because
+        /// fingers lifting mid-gesture shift the centroid. See
+        /// `calculate_rotation_delta` for the per-frame math.
+        start_rotation: f64,
     },
 }
 
@@ -277,6 +315,12 @@ impl ActiveTouchBind {
             Self::Swipe { kind, .. } | Self::Pinch { kind, .. } | Self::Rotate { kind, .. } => {
                 *kind
             }
+        }
+    }
+
+    pub fn into_tag(self) -> Option<String> {
+        match self {
+            Self::Swipe { tag, .. } | Self::Pinch { tag, .. } | Self::Rotate { tag, .. } => tag,
         }
     }
 }

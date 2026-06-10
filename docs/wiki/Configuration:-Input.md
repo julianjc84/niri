@@ -52,6 +52,7 @@ input {
         // properties. This subblock only contains tuning parameters.
         // gestures {
         //     swipe-trigger-distance 16.0
+        //     swipe-progress-distance 40.0
         // }
     }
 
@@ -118,9 +119,12 @@ input {
             // pinch-trigger-distance 100.0     // px of spread change before pinch latches
             // pinch-dominance-ratio 1.0        // spread must beat swipe × this (higher = stricter pinch)
             // pinch-sensitivity 1.0
+            // pinch-progress-distance 100.0    // px of spread = IPC progress ±1.0 (signed)
             // swipe-multi-finger-scale 1.2     // scales swipe-trigger-distance for 4+ fingers (1.0 = off)
+            // swipe-progress-distance 200.0    // px of swipe = IPC progress 1.0
             // rotation-trigger-angle 20.0      // ° before rotation can latch
             // rotation-dominance-ratio 0.5     // arc must beat swipe × this (higher = stricter rotation)
+            // rotation-progress-angle 90.0     // ° that map to IPC progress ±1.0
         }
     }
 
@@ -306,17 +310,20 @@ All knobs are grouped as: **trigger** (classifier commit gates), **dominance** (
 
 - `swipe-trigger-distance <float>`: pixels of centroid motion before a swipe gesture commits. Lower values feel more responsive but risk triggering on incidental finger drift. Default: `100.0`.
 - `swipe-multi-finger-scale <float>`: scaling applied to `swipe-trigger-distance` for gestures with more than 3 fingers. The formula is `base * (1 + (fingers − 3) * (scale − 1))`, so with a base of 100 and scale 1.2 a 4-finger swipe needs 120 px and a 5-finger swipe needs 140 px. Default `1.2` — gives a small pinch-priority bias at high finger counts so ambiguous 4/5-finger motions resolve as pinch rather than swipe. Set `1.0` to disable the bias entirely.
+- `swipe-progress-distance <float>`: pixels of swipe distance that map to IPC `GestureProgress = 1.0`. IPC-output knob — doesn't affect classification. Tune this for tagged external-app gestures (sidebar drawers, scrubbers, etc.). Default: `200.0`.
 
 **Pinch:**
 
 - `pinch-trigger-distance <float>`: pixels of `|spread_change|` before a pinch gesture commits. Default: `100.0`.
 - `pinch-dominance-ratio <float>`: `|spread_change|` must exceed `swipe_distance × this` for pinch to win the race against swipe. Higher = stricter pinch. Default: `1.0`.
 - `pinch-sensitivity <float>`: multiplier mapping finger spread change to continuous pinch animation delta (e.g. overview open/close progress). At `1.0`, one pixel of spread change contributes one pixel to the gesture accumulator. Applies to **all** pinch-bound continuous actions — the bind's own `sensitivity=` property is ignored for pinch because raw spread-delta pixels need different scaling from linear swipe distances. Default: `1.0`.
+- `pinch-progress-distance <float>`: pixels of spread change that map to IPC `GestureProgress = ±1.0`. Signed: positive for pinch-out, negative for pinch-in. Default: `100.0`.
 
 **Rotation:**
 
 - `rotation-trigger-angle <float>`: cumulative rotation in **degrees** before a rotation gesture commits. Default: `20.0`. Rotation detection is an early proof of concept — see the warning in the [Rotation Gestures](./Gestures.md#rotation-gestures) section.
 - `rotation-dominance-ratio <float>`: rotation arc length (`|cumulative_rotation| × cluster_radius`) must exceed both `swipe_distance × this` and `|spread_change| × this` for rotation to win the race. Higher = stricter rotation. Default: `0.5` (deliberately lenient — rotation almost always includes incidental translation). Matches `pinch-dominance-ratio` semantics (higher = stricter for both).
+- `rotation-progress-angle <float>`: degrees of cumulative rotation that map to IPC `GestureProgress = ±1.0`. Signed: positive = counter-clockwise, negative = clockwise. Default: `90.0`.
 
 **Edge:**
 
@@ -331,6 +338,8 @@ input {
             swipe-trigger-distance 26.0
             edge-start-distance 30.0
             pinch-sensitivity 1.0
+            swipe-progress-distance 200.0
+            pinch-progress-distance 100.0
             rotation-trigger-angle 15.0
             rotation-dominance-ratio 0.5
         }
@@ -345,6 +354,7 @@ input {
 The `touchpad { gestures { } }` subblock contains tuning parameters for touchpad gesture recognition. Like touchscreen, the actual gesture binds (`TouchpadSwipe fingers=N direction="..."`, `TouchpadPinch fingers=N direction="..."`) live in the main `binds {}` block.
 
 - `swipe-trigger-distance <float>`: libinput delta units of centroid motion before a swipe gesture commits. These units are acceleration-adjusted and not directly comparable to touchscreen pixels. Default: `16.0`.
+- `swipe-progress-distance <float>`: libinput delta units of swipe motion that map to IPC `GestureProgress = 1.0`. Because libinput acceleration curves are nonlinear, the same physical swipe can produce different delta magnitudes depending on speed — this value is **not** directly comparable to the touchscreen `swipe-progress-distance`. Default: `40.0`.
 - `pinch-trigger-scale <float>`: `|scale - 1.0|` required before a `TouchpadPinch` bind fires. libinput normalizes pinch scale (1.0 = no change, 1.5 = 50% spread out, 0.5 = 50% spread in), so this is a unitless ratio and **not** directly comparable to the touchscreen `pinch-trigger-distance` (which is in pixels). Fires once per gesture when the threshold is crossed; direction is picked from the sign of the scale change. Default: `0.15`.
 
 Example:
@@ -354,6 +364,7 @@ input {
     touchpad {
         gestures {
             swipe-trigger-distance 16.0
+            swipe-progress-distance 40.0
             pinch-trigger-scale 0.15
         }
     }

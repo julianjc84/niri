@@ -67,7 +67,7 @@ binds {
 }
 ```
 
-Tuning parameters for touchpad gesture recognition (`swipe-trigger-distance`, `pinch-trigger-scale`) live in the `input { touchpad { gestures { } } }` subblock — see [Configuration: Input](./Configuration:-Input.md#touchpad-gesture-tuning).
+Tuning parameters for touchpad gesture recognition (`swipe-trigger-distance`, `swipe-progress-distance`, `pinch-trigger-scale`) live in the `input { touchpad { gestures { } } }` subblock — see [Configuration: Input](./Configuration:-Input.md#touchpad-gesture-tuning).
 
 #### Workspace Switch
 
@@ -193,7 +193,7 @@ Pinch vs swipe classification is controlled by the `pinch-trigger-distance` and 
 
 > [!WARNING]
 >
-> Rotation detection is an early proof of concept and is currently **buggy and intermittent** on real hardware — recognition can misfire, lock at the wrong finger count, or fail to latch. The math and bind plumbing are in place and tests pass, but real-world tuning still needs work. Use with caution and expect false positives / misses while this settles.
+> Rotation detection is an early proof of concept and is currently **buggy and intermittent** on real hardware — recognition can misfire, lock at the wrong finger count, or fail to latch. The math, IPC, and bind plumbing are in place and tests pass, but real-world tuning still needs work. Use with caution and expect false positives / misses while this settles.
 
 Twisting the finger cluster clockwise or counter-clockwise (around its centroid) fires a rotation gesture. Rotation is detected from the averaged per-finger angle change, so the noise floor is √N lower than single-finger angular drift.
 
@@ -208,9 +208,9 @@ binds {
 - `fingers=` — integer in `3..=10`. Required.
 - `direction=` — one of `"cw"` (clockwise on screen) or `"ccw"` (counter-clockwise on screen). Required. The sign convention assumes the y-axis points down (standard screen coordinates).
 
-Rotation classification runs before pinch and swipe classification, so a clearly rotating finger cluster wins over any incidental spread or translation. Tuning lives under `input { touchscreen { gestures { } } }`: `rotation-trigger-angle` (minimum **degrees** before it latches, default 15°) and `rotation-dominance-ratio` (how much rotation arc length must dominate swipe/spread change, default 0.5 — higher = stricter rotation, matching `pinch-dominance-ratio` semantics).
+Rotation classification runs before pinch and swipe classification, so a clearly rotating finger cluster wins over any incidental spread or translation. Tuning lives under `input { touchscreen { gestures { } } }`: `rotation-trigger-angle` (minimum **degrees** before it latches, default 15°), `rotation-dominance-ratio` (how much rotation arc length must dominate swipe/spread change, default 0.5 — higher = stricter rotation, matching `pinch-dominance-ratio` semantics), and `rotation-progress-angle` (degrees that map to IPC `progress = ±1.0`, default 90°).
 
-Rotation gestures are **continuous** in the same sense as pinch: binding them to a continuous-capable action animates frame-by-frame.
+Rotation gestures are **continuous** in the same sense as pinch: binding them to a continuous-capable action animates frame-by-frame, and tagged rotations emit `GestureProgress` events where the delta is `GestureDelta::Rotate { d_radians }`.
 
 Pinch gestures are **continuous**: when bound to a continuous-capable action like `open-overview`, `close-overview`, `toggle-overview`, `focus-workspace-*`, `focus-column-*`, or `noop`, the animation tracks finger motion frame-by-frame (pinch-in smoothly opens the overview, reversing the pinch smoothly closes it again). Binding a pinch to a non-continuous action like `spawn` or `close-window` still fires the action once on recognition, as before.
 
@@ -341,6 +341,54 @@ binds {
 ```
 
 Tuning parameters for touchscreen gesture recognition all live in the `input { touchscreen { gestures { } } }` subblock — see [Configuration: Input](./Configuration:-Input.md#touchscreen).
+
+### Gesture Tags and IPC Events
+
+<sup>Since: next</sup>
+
+Any gesture bind (touchscreen or touchpad) can carry a `tag="..."` property. When the gesture fires, niri emits `GestureBegin`, `GestureProgress`, and `GestureEnd` events on its IPC event stream, carrying the tag string. External applications subscribing to the event stream can react to those events — drive a sidebar drawer, show a scrubbing HUD, move a slider, etc.
+
+```kdl
+binds {
+    // Tagged workspace switch — still switches workspaces, and also
+    // emits GestureProgress events with tag="ws-nav" for external apps
+    // that want to show a progress indicator alongside the animation.
+    TouchSwipe fingers=3 direction="up"   tag="ws-nav" { focus-workspace-up; }
+    TouchSwipe fingers=3 direction="down" tag="ws-nav" { focus-workspace-down; }
+
+    // Noop-tagged edge swipe — drives no compositor action, just emits
+    // IPC progress events so an external app (e.g. a sidebar drawer)
+    // can follow the finger.
+    TouchEdge edge="left"  tag="sidebar-left"  { noop; }
+    TouchEdge edge="right" tag="sidebar-right" { noop; }
+}
+```
+
+The three IPC events are:
+
+- **`GestureBegin { tag, trigger, finger_count, is_continuous }`** — fired when gesture recognition has locked in. `is_continuous` is true for swipe, pinch, and edge gestures bound to continuous-capable actions (including `noop`), and false for discrete gestures bound to one-shot actions.
+- **`GestureProgress { tag, progress, delta, timestamp_ms }`** — fired repeatedly while a continuous gesture is in motion.
+  - `progress` is **signed, unbounded**, normalized: it starts at `0.0` when the gesture is recognized and grows as the gesture continues. Reversing direction produces negative values, and overshoot can exceed `±1.0` — consumers should not assume the value is clamped.
+  - For **swipes and edge gestures**, progress accumulates adjusted (sensitivity-scaled, natural-scroll-adjusted) finger delta on the dominant axis, normalized by `swipe-progress-distance` (default 200 px for touchscreen, 40 libinput units for touchpad — same knob name, separate config block). Progress `±1.0` ≈ one progress-distance of movement.
+  - For **pinches**, progress is `(current_spread - start_spread) / pinch-progress-distance` (default 100 px). Positive = pinch-out (spread growing), negative = pinch-in.
+  - For **rotations**, progress is cumulative signed rotation divided by `rotation-progress-angle` (configured in **degrees**, default 90°). Positive = counter-clockwise on screen, negative = clockwise on screen.
+  - `delta` is a tagged enum carrying the per-event raw delta in a gesture-specific shape:
+    - `GestureDelta::Swipe { dx, dy }` — per-event finger delta in screen pixels (touchscreen) or libinput units (touchpad).
+    - `GestureDelta::Pinch { d_spread }` — per-event change in finger spread.
+    - `GestureDelta::Rotate { d_radians }` — per-event change in the averaged per-finger angle. Signed with the same on-screen convention as `progress`.
+- **`GestureEnd { tag, completed }`** — fired when the gesture ends (fingers released).
+
+#### Noop Gestures
+
+Binding a tagged gesture to `noop` means the gesture emits IPC events without driving any compositor animation. This is the cleanest case for external apps: progress is the sole output, and the external app has full control over its own thresholds and snap behavior. Used by [niri-tag-sidebar](https://github.com/julianjc84/niri-tag-sidebar) for edge-swipe drawer panels.
+
+#### Progress vs Compositor Animation
+
+> [!WARNING]
+>
+> When a tagged gesture *also* drives a compositor animation (e.g. a tagged workspace switch), niri uses its own internal thresholds to decide when to commit the action — these are independent of the IPC `progress` value. An external app watching the progress value can't reliably predict when niri will actually commit. For `noop` gestures this isn't a concern because progress is the sole output.
+
+The `GestureEnd.completed` field is currently hardcoded `true` for touchscreen gestures and does **not** indicate whether niri actually committed the bound action.
 
 ### All Pointing Devices
 

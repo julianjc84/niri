@@ -235,6 +235,15 @@ impl Touchpad {
             .unwrap_or(16.0)
     }
 
+    /// Libinput delta units of swipe motion that map to IPC
+    /// `GestureProgress = 1.0`. Default 40.
+    pub fn swipe_progress_distance(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.swipe_progress_distance)
+            .unwrap_or(40.0)
+    }
+
     /// Pinch commit gate in scale-ratio units (from
     /// `pinch-trigger-scale`). `|scale - 1.0|` must exceed this before a
     /// `TouchpadPinch` bind fires. Default 0.15.
@@ -466,6 +475,24 @@ impl Touchscreen {
             .unwrap_or(1.2)
     }
 
+    /// Pixels of swipe distance that map to IPC `GestureProgress = 1.0`.
+    /// Default 200.
+    pub fn swipe_progress_distance(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.swipe_progress_distance)
+            .unwrap_or(200.0)
+    }
+
+    /// Pixels of spread change that map to IPC `GestureProgress = ±1.0`.
+    /// Default 100.
+    pub fn pinch_progress_distance(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.pinch_progress_distance)
+            .unwrap_or(100.0)
+    }
+
     /// Rotation commit gate: cumulative rotation must exceed this many
     /// **degrees** (in the KDL config — converted to radians internally)
     /// before a rotation can latch. Default 20°.
@@ -494,6 +521,18 @@ impl Touchscreen {
             .as_ref()
             .and_then(|g| g.rotation_dominance_ratio)
             .unwrap_or(0.5)
+    }
+
+    /// Degrees of rotation (in the KDL config — converted to radians
+    /// internally) that map to IPC `GestureProgress = ±1.0` for rotation
+    /// gestures. Default 90°.
+    pub fn rotation_progress_angle(&self) -> f64 {
+        let deg = self
+            .gestures
+            .as_ref()
+            .and_then(|g| g.rotation_progress_angle)
+            .unwrap_or(90.0);
+        deg.to_radians()
     }
 
     /// Returns the swipe trigger distance scaled for a given finger
@@ -631,6 +670,18 @@ pub struct TouchscreenGesturesConfig {
     /// pinch rather than swipe. Set 1.0 to disable the bias entirely.
     #[knuffel(child, unwrap(argument))]
     pub swipe_multi_finger_scale: Option<f64>,
+    /// Pixels of swipe distance that map to IPC `GestureProgress = 1.0`.
+    /// IPC-only output knob — doesn't affect classification. Tune this
+    /// to make tagged external-app gestures (sidebar drawers etc.) feel
+    /// right on your display. Default: 200.0.
+    #[knuffel(child, unwrap(argument))]
+    pub swipe_progress_distance: Option<f64>,
+    /// Pixels of spread change that map to IPC
+    /// `GestureProgress = ±1.0` for pinch gestures. Signed: positive for
+    /// pinch-out (spread growing), negative for pinch-in (spread
+    /// shrinking). Default: 100.0.
+    #[knuffel(child, unwrap(argument))]
+    pub pinch_progress_distance: Option<f64>,
     /// Rotation commit gate: cumulative rotation (in **degrees**)
     /// required before a rotation gesture latches. Converted to radians
     /// internally. Default: 20°.
@@ -645,6 +696,11 @@ pub struct TouchscreenGesturesConfig {
     /// nearly all real-world rotations).
     #[knuffel(child, unwrap(argument))]
     pub rotation_dominance_ratio: Option<f64>,
+    /// Degrees of cumulative rotation that map to IPC
+    /// `GestureProgress = ±1.0` for rotation gestures. Signed: positive
+    /// for counter-clockwise, negative for clockwise. Default: 90°.
+    #[knuffel(child, unwrap(argument))]
+    pub rotation_progress_angle: Option<f64>,
     /// Maximum per-finger displacement (in pixels) allowed during a tap
     /// gesture. If any single finger moves more than this distance from
     /// its initial landing position, the tap candidate is killed and the
@@ -677,6 +733,14 @@ pub struct TouchpadGesturesConfig {
     /// and not directly comparable to touchscreen pixels. Default: 16.0.
     #[knuffel(child, unwrap(argument))]
     pub swipe_trigger_distance: Option<f64>,
+    /// Libinput delta units of swipe movement that map to IPC
+    /// `GestureProgress = 1.0`. Because libinput acceleration curves are
+    /// nonlinear, the same physical swipe can produce different delta
+    /// magnitudes depending on speed — this value is not directly
+    /// comparable to the touchscreen `swipe-progress-distance`.
+    /// Default: 40.0.
+    #[knuffel(child, unwrap(argument))]
+    pub swipe_progress_distance: Option<f64>,
     /// Pinch commit gate: `|scale - 1.0|` must exceed this unitless scale
     /// ratio before a `TouchpadPinch` bind fires. libinput normalizes
     /// pinch scale (1.0 = no change, 1.5 = 50% spread out, 0.5 = 50%

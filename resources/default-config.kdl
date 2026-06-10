@@ -53,6 +53,7 @@ input {
         //     // Libinput delta units of motion before a swipe commits.
         //     swipe-trigger-distance 16.0
         //     // Libinput delta units of swipe that map to IPC progress = 1.0.
+        //     swipe-progress-distance 40.0
         // }
     }
 
@@ -115,10 +116,14 @@ input {
     //     //     // Default 1.2 = small pinch-priority bias at high finger
     //     //     // counts. Set 1.0 to disable.
     //     //     swipe-multi-finger-scale 1.2
+    //     //     // IPC progress scaling (doesn't affect classification).
+    //     //     swipe-progress-distance 200.0  // px of swipe = progress 1.0
+    //     //     pinch-progress-distance 100.0  // px of spread = progress ±1.0 (signed)
     //     //
     //     //     // Rotation — angles in DEGREES.
     //     //     rotation-trigger-angle 20.0    // ° before rotation can latch
     //     //     rotation-dominance-ratio 0.5   // arc must beat swipe × this (higher = stricter)
+    //     //     rotation-progress-angle 90.0   // ° that map to IPC progress ±1.0
     //     // }
     // }
 

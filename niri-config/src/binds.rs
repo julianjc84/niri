@@ -65,6 +65,12 @@ pub struct Bind {
     pub sensitivity: Option<f64>,
     /// Natural scroll for touchscreen gesture binds.
     pub natural_scroll: bool,
+    /// Optional tag for IPC gesture events.
+    /// When set, gesture begin/progress/end events are emitted on the IPC
+    /// event stream with this tag, allowing external tools to react.
+    /// Restricted to gesture triggers only (Touch*/Touchpad*) — rejected
+    /// on keyboard/mouse binds to prevent IPC event stream keylogging.
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -197,6 +203,26 @@ pub enum Trigger {
         edge: ScreenEdge,
         zone: Option<EdgeZone>,
     },
+}
+
+impl Trigger {
+    /// Returns true if this trigger is a gesture (touchscreen or touchpad).
+    /// Only gesture triggers support IPC tag events.
+    pub fn is_gesture(&self) -> bool {
+        matches!(
+            self,
+            Trigger::TouchpadSwipe { .. }
+                | Trigger::TouchpadTapHold { .. }
+                | Trigger::TouchpadTapHoldDrag { .. }
+                | Trigger::TouchpadPinch { .. }
+                | Trigger::TouchSwipe { .. }
+                | Trigger::TouchPinch { .. }
+                | Trigger::TouchRotate { .. }
+                | Trigger::TouchTap { .. }
+                | Trigger::TouchTapHoldDrag { .. }
+                | Trigger::TouchEdge { .. }
+        )
+    }
 }
 
 bitflags! {
@@ -536,7 +562,8 @@ pub enum Action {
     #[knuffel(skip)]
     MruCycleScope,
     /// No-op action: the bind matches and consumes the gesture but does
-    /// nothing inside the compositor.
+    /// nothing inside the compositor. Useful with `tag` to pipe gesture
+    /// events to external tools via IPC without triggering any niri action.
     Noop,
 }
 
@@ -1014,6 +1041,7 @@ where
         let mut hotkey_overlay_title = None;
         let mut sensitivity = None;
         let mut natural_scroll = false;
+        let mut tag = None;
 
         // Gesture-specific properties, only populated / legal when
         // `is_gesture_family` is true.
@@ -1048,6 +1076,9 @@ where
                 "natural-scroll" => {
                     natural_scroll = knuffel::traits::DecodeScalar::decode(val, ctx)?;
                 }
+                "tag" => {
+                    tag = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
+                }
                 // Gesture-specific properties. Note that knuffel stores
                 // `node.properties` as a BTreeMap keyed on name, so a
                 // KDL node written with `fingers=3 fingers=5 ...` is
@@ -1058,7 +1089,7 @@ where
                 // the raw KDL source before knuffel parses it, which
                 // isn't worth it. Last-wins is KDL-level behavior,
                 // and users who care get the same hazard on every
-                // other bind property (`cooldown-ms=`, etc.).
+                // other bind property (`tag=`, `cooldown-ms=`, etc.).
                 "fingers" if is_gesture_family => {
                     gesture_fingers = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
                 }
@@ -1100,6 +1131,21 @@ where
             key_from_name.unwrap()
         };
 
+        // Tags are only supported on gesture triggers (touchscreen/touchpad).
+        // Allowing tags on keyboard/mouse binds would let the IPC event stream
+        // be used as a keylogger — every tagged keypress would emit an event
+        // with the key name to any process listening on the socket. Gestures
+        // are safe because they don't carry text input (you can't type a
+        // password with a 3-finger swipe).
+        if tag.is_some() && !key.trigger.is_gesture() {
+            ctx.emit_error(DecodeError::unexpected(
+                &node.node_name,
+                "property",
+                "tag is only supported on gesture triggers (Touch*/Touchpad*)",
+            ));
+            tag = None;
+        }
+
         let mut children = node.children();
 
         // If the action is invalid but the key is fine, we still want to return something.
@@ -1115,6 +1161,7 @@ where
             hotkey_overlay_title: None,
             sensitivity: None,
             natural_scroll: false,
+            tag: None,
         };
 
         if let Some(child) = children.next() {
@@ -1153,6 +1200,7 @@ where
                         hotkey_overlay_title,
                         sensitivity,
                         natural_scroll,
+                        tag,
                     })
                 }
                 Err(e) => {
@@ -1914,6 +1962,26 @@ mod tests {
     }
 
     #[test]
+    fn decode_node_tag_on_gesture_allowed() {
+        let cfg = parse_binds(
+            r#"TouchSwipe fingers=3 direction="up" tag="ws-nav" { focus-workspace-up; }"#,
+        );
+        let bind = first_bind(&cfg);
+        assert_eq!(bind.tag.as_deref(), Some("ws-nav"));
+    }
+
+    #[test]
+    fn decode_node_tag_on_keyboard_bind_rejected() {
+        // tag="..." is a keylogging risk on keyboard binds and should
+        // fail parsing.
+        let err = parse_binds_err(r#"Ctrl+A tag="keylog" { spawn "uname"; }"#);
+        assert!(
+            err.contains("tag is only supported on gesture triggers"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn decode_node_gesture_property_on_keyboard_bind_rejected() {
         // `fingers=3` on a keyboard bind should fall through to the
         // "unexpected property" arm.
@@ -1983,7 +2051,9 @@ mod tests {
     fn decode_node_mod_shift_touchedge_zoned() {
         // Multi-modifier + zoned edge, exercising the full modifier
         // stripping + property path.
-        let cfg = parse_binds(r#"Mod+Shift+TouchEdge edge="right" zone="bottom" { noop; }"#);
+        let cfg = parse_binds(
+            r#"Mod+Shift+TouchEdge edge="right" zone="bottom" tag="zone-rb" { noop; }"#,
+        );
         let bind = first_bind(&cfg);
         assert_eq!(
             bind.key.trigger,
@@ -1994,6 +2064,7 @@ mod tests {
         );
         assert!(bind.key.modifiers.contains(Modifiers::COMPOSITOR));
         assert!(bind.key.modifiers.contains(Modifiers::SHIFT));
+        assert_eq!(bind.tag.as_deref(), Some("zone-rb"));
     }
 
     #[test]
