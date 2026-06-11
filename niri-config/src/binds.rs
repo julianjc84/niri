@@ -42,6 +42,35 @@ pub enum RotateDirection {
     Ccw,
 }
 
+/// Which hand a Leap Motion gesture bind matches.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum LeapHand {
+    /// Match either hand.
+    #[default]
+    Any,
+    Left,
+    Right,
+}
+
+/// Axis for a Leap Motion grab-drag gesture.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum LeapAxis {
+    /// Left/right (the device's x axis).
+    Horizontal,
+    /// Up/down (the device's y axis).
+    Vertical,
+    /// Forward/back — pushing the fist away from you or pulling it
+    /// toward you (the device's z axis). KDL: `axis="depth"`.
+    Depth,
+}
+
+/// Hand presence transition for `LeapPresence` binds.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum LeapPresenceEvent {
+    Appear,
+    Vanish,
+}
+
 /// Inclusive bounds on the `fingers=` property for multi-finger gestures.
 /// Parser rejects `fingers` values outside `[MIN_FINGERS, MAX_FINGERS]`.
 /// `< 3` would collide with two-finger passthrough (scroll/zoom) and plain
@@ -196,6 +225,58 @@ pub enum Trigger {
     TouchEdge {
         edge: ScreenEdge,
         zone: Option<EdgeZone>,
+    },
+    /// Air pinch on an Ultraleap hand-tracking device: thumb-to-finger
+    /// pinch strength crossing the trigger threshold
+    /// (`input.leap.gestures.pinch-trigger-strength`). Discrete — fires
+    /// once per pinch, re-arms when strength drops below the release
+    /// threshold (hysteresis).
+    ///
+    /// KDL syntax: `LeapPinch` or `LeapPinch hand="right"`.
+    LeapPinch {
+        hand: LeapHand,
+    },
+    /// Palm swipe on an Ultraleap device: palm velocity exceeding the
+    /// trigger speed (`swipe-trigger-speed`, mm/s) along a screen axis.
+    /// Discrete — fires once per stroke, re-arms when the palm slows
+    /// below the re-arm speed.
+    ///
+    /// KDL syntax: `LeapSwipe direction="left"` (+ optional `hand=`).
+    LeapSwipe {
+        hand: LeapHand,
+        direction: SwipeDirection,
+    },
+    /// Grab-drag on an Ultraleap device: fist closes (grab strength past
+    /// the trigger threshold), then palm displacement along `axis` drives
+    /// a continuous action; opening the fist ends the gesture. Axes:
+    /// `horizontal` (left/right), `vertical` (up/down), `depth`
+    /// (forward/back — pushing away from / pulling toward you).
+    ///
+    /// KDL syntax: `LeapGrabDrag axis="vertical"` (+ optional `hand=`).
+    LeapGrabDrag {
+        hand: LeapHand,
+        axis: LeapAxis,
+    },
+    /// Hand presence transition on an Ultraleap device: a hand appearing
+    /// over or vanishing from the sensor's view (debounced). Discrete.
+    ///
+    /// KDL syntax: `LeapPresence event="appear"` (+ optional `hand=`).
+    LeapPresence {
+        hand: LeapHand,
+        event: LeapPresenceEvent,
+    },
+    /// Finger-count pose on an Ultraleap device: holding up N extended
+    /// fingers on a near-stationary hand. The tracking service reports
+    /// per-digit extended flags; the recognizer fires once when the
+    /// count has been stable for `pose-settle-ms` with the palm slower
+    /// than `pose-max-speed`, and re-arms when the count changes.
+    /// `fingers` is `1..=5` — zero extended fingers is a fist, which is
+    /// `LeapGrabDrag` territory. Discrete.
+    ///
+    /// KDL syntax: `LeapPose fingers=3` (+ optional `hand=`).
+    LeapPose {
+        hand: LeapHand,
+        fingers: u8,
     },
 }
 
@@ -1021,6 +1102,9 @@ where
         let mut gesture_direction: Option<String> = None;
         let mut gesture_edge: Option<String> = None;
         let mut gesture_zone: Option<String> = None;
+        let mut gesture_hand: Option<String> = None;
+        let mut gesture_axis: Option<String> = None;
+        let mut gesture_event: Option<String> = None;
 
         for (name, val) in &node.properties {
             match &***name {
@@ -1071,6 +1155,15 @@ where
                 "zone" if is_gesture_family => {
                     gesture_zone = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
                 }
+                "hand" if is_gesture_family => {
+                    gesture_hand = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
+                }
+                "axis" if is_gesture_family => {
+                    gesture_axis = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
+                }
+                "event" if is_gesture_family => {
+                    gesture_event = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
+                }
                 name_str => {
                     ctx.emit_error(DecodeError::unexpected(
                         name,
@@ -1089,6 +1182,9 @@ where
                 direction: gesture_direction.as_deref(),
                 edge: gesture_edge.as_deref(),
                 zone: gesture_zone.as_deref(),
+                hand: gesture_hand.as_deref(),
+                axis: gesture_axis.as_deref(),
+                event: gesture_event.as_deref(),
             };
             match build_gesture_trigger(trigger_name, &props) {
                 Ok(trigger) => Key { trigger, modifiers },
@@ -1184,7 +1280,23 @@ pub(crate) fn is_gesture_family_name(s: &str) -> bool {
         || s.eq_ignore_ascii_case("TouchTap")
         || s.eq_ignore_ascii_case("TouchTapHoldDrag")
         || s.eq_ignore_ascii_case("TouchEdge")
+        || is_leap_family_name(s)
 }
+
+/// Returns true if `s` names one of the Leap Motion (Ultraleap hand
+/// tracking) gesture families.
+pub(crate) fn is_leap_family_name(s: &str) -> bool {
+    s.eq_ignore_ascii_case("LeapPinch")
+        || s.eq_ignore_ascii_case("LeapSwipe")
+        || s.eq_ignore_ascii_case("LeapGrabDrag")
+        || s.eq_ignore_ascii_case("LeapPresence")
+        || s.eq_ignore_ascii_case("LeapPose")
+}
+
+/// Inclusive bounds on `fingers=` for `LeapPose` binds: one human hand.
+/// Zero extended fingers is a fist — that's `LeapGrabDrag` territory.
+pub const MIN_LEAP_POSE_FINGERS: u8 = 1;
+pub const MAX_LEAP_POSE_FINGERS: u8 = 5;
 
 /// Splits `Ctrl+Shift+Foo` into `(modifiers, "Foo")`.
 fn parse_modifiers(s: &str) -> Result<(Modifiers, &str), miette::Error> {
@@ -1224,6 +1336,12 @@ pub(crate) struct GestureTriggerProps<'a> {
     pub direction: Option<&'a str>,
     pub edge: Option<&'a str>,
     pub zone: Option<&'a str>,
+    /// Leap families only: `hand="left|right|any"`.
+    pub hand: Option<&'a str>,
+    /// `LeapGrabDrag` only: `axis="horizontal|vertical"`.
+    pub axis: Option<&'a str>,
+    /// `LeapPresence` only: `event="appear|vanish"`.
+    pub event: Option<&'a str>,
 }
 
 /// Build a parameterized gesture `Trigger` from a family name and the
@@ -1256,6 +1374,24 @@ pub(crate) fn build_gesture_trigger(
         }
         Ok(())
     };
+
+    // hand= / axis= / event= belong to the Leap families; edge= / zone=
+    // belong to the touch families (fingers= is shared: touch families
+    // and `LeapPose`). Reject the mismatched set up front so each family
+    // arm below only validates its own vocabulary.
+    if is_leap_family_name(family) {
+        reject_edge_zone(props)?;
+        return build_leap_trigger(family, props);
+    }
+    if props.hand.is_some() {
+        return Err(format!("{family} does not accept a `hand=` property"));
+    }
+    if props.axis.is_some() {
+        return Err(format!("{family} does not accept an `axis=` property"));
+    }
+    if props.event.is_some() {
+        return Err(format!("{family} does not accept an `event=` property"));
+    }
 
     if family.eq_ignore_ascii_case("TouchSwipe") || family.eq_ignore_ascii_case("TouchpadSwipe") {
         reject_edge_zone(props)?;
@@ -1431,6 +1567,138 @@ pub(crate) fn build_gesture_trigger(
     Err(format!("unknown gesture family `{family}`"))
 }
 
+/// Build a Leap Motion gesture `Trigger`. Called from
+/// `build_gesture_trigger` after the cross-family property check, so
+/// `edge`/`zone` are already known to be absent.
+fn build_leap_trigger(family: &str, props: &GestureTriggerProps<'_>) -> Result<Trigger, String> {
+    let hand = match props.hand {
+        None => LeapHand::Any,
+        Some(h) => match h.to_ascii_lowercase().as_str() {
+            "any" => LeapHand::Any,
+            "left" => LeapHand::Left,
+            "right" => LeapHand::Right,
+            other => {
+                return Err(format!(
+                    "invalid hand=\"{other}\" for {family} (expected left|right|any)"
+                ))
+            }
+        },
+    };
+    let reject_direction = |props: &GestureTriggerProps<'_>| -> Result<(), String> {
+        if props.direction.is_some() {
+            return Err(format!("{family} does not accept a `direction=` property"));
+        }
+        Ok(())
+    };
+    let reject_axis = |props: &GestureTriggerProps<'_>| -> Result<(), String> {
+        if props.axis.is_some() {
+            return Err(format!("{family} does not accept an `axis=` property"));
+        }
+        Ok(())
+    };
+    let reject_event = |props: &GestureTriggerProps<'_>| -> Result<(), String> {
+        if props.event.is_some() {
+            return Err(format!("{family} does not accept an `event=` property"));
+        }
+        Ok(())
+    };
+    let reject_fingers = |props: &GestureTriggerProps<'_>| -> Result<(), String> {
+        if props.fingers.is_some() {
+            return Err(format!("{family} does not accept a `fingers=` property"));
+        }
+        Ok(())
+    };
+
+    if family.eq_ignore_ascii_case("LeapPinch") {
+        reject_direction(props)?;
+        reject_axis(props)?;
+        reject_event(props)?;
+        reject_fingers(props)?;
+        return Ok(Trigger::LeapPinch { hand });
+    }
+
+    if family.eq_ignore_ascii_case("LeapSwipe") {
+        reject_axis(props)?;
+        reject_event(props)?;
+        reject_fingers(props)?;
+        let direction = props
+            .direction
+            .ok_or_else(|| format!("{family} requires `direction=\"up|down|left|right\"`"))?;
+        let direction = match direction.to_ascii_lowercase().as_str() {
+            "up" => SwipeDirection::Up,
+            "down" => SwipeDirection::Down,
+            "left" => SwipeDirection::Left,
+            "right" => SwipeDirection::Right,
+            other => {
+                return Err(format!(
+                    "invalid direction=\"{other}\" for {family} (expected up|down|left|right)"
+                ))
+            }
+        };
+        return Ok(Trigger::LeapSwipe { hand, direction });
+    }
+
+    if family.eq_ignore_ascii_case("LeapGrabDrag") {
+        reject_direction(props)?;
+        reject_event(props)?;
+        reject_fingers(props)?;
+        let axis = props
+            .axis
+            .ok_or_else(|| format!("{family} requires `axis=\"horizontal|vertical|depth\"`"))?;
+        let axis = match axis.to_ascii_lowercase().as_str() {
+            "horizontal" => LeapAxis::Horizontal,
+            "vertical" => LeapAxis::Vertical,
+            "depth" => LeapAxis::Depth,
+            other => {
+                return Err(format!(
+                    "invalid axis=\"{other}\" for {family} (expected horizontal|vertical|depth)"
+                ))
+            }
+        };
+        return Ok(Trigger::LeapGrabDrag { hand, axis });
+    }
+
+    if family.eq_ignore_ascii_case("LeapPresence") {
+        reject_direction(props)?;
+        reject_axis(props)?;
+        reject_fingers(props)?;
+        let event = props
+            .event
+            .ok_or_else(|| format!("{family} requires `event=\"appear|vanish\"`"))?;
+        let event = match event.to_ascii_lowercase().as_str() {
+            "appear" => LeapPresenceEvent::Appear,
+            "vanish" => LeapPresenceEvent::Vanish,
+            other => {
+                return Err(format!(
+                    "invalid event=\"{other}\" for {family} (expected appear|vanish)"
+                ))
+            }
+        };
+        return Ok(Trigger::LeapPresence { hand, event });
+    }
+
+    if family.eq_ignore_ascii_case("LeapPose") {
+        reject_direction(props)?;
+        reject_axis(props)?;
+        reject_event(props)?;
+        let Some(fingers) = props.fingers else {
+            return Err(format!(
+                "{family} requires `fingers=N` (valid range \
+                 {MIN_LEAP_POSE_FINGERS}..={MAX_LEAP_POSE_FINGERS})"
+            ));
+        };
+        if !(MIN_LEAP_POSE_FINGERS..=MAX_LEAP_POSE_FINGERS).contains(&fingers) {
+            return Err(format!(
+                "fingers={fingers} out of range for {family} (valid range \
+                 {MIN_LEAP_POSE_FINGERS}..={MAX_LEAP_POSE_FINGERS})"
+            ));
+        }
+        return Ok(Trigger::LeapPose { hand, fingers });
+    }
+
+    Err(format!("unknown leap gesture family `{family}`"))
+}
+
 impl FromStr for Key {
     type Err = miette::Error;
 
@@ -1598,6 +1866,193 @@ mod tests {
         assert!("TouchpadTapHoldDrag".parse::<Key>().is_err());
         assert!("TouchpadPinch".parse::<Key>().is_err());
         assert!("TouchTapHoldDrag".parse::<Key>().is_err());
+        assert!("LeapPinch".parse::<Key>().is_err());
+        assert!("LeapSwipe".parse::<Key>().is_err());
+        assert!("LeapGrabDrag".parse::<Key>().is_err());
+        assert!("LeapPresence".parse::<Key>().is_err());
+        assert!("LeapPose".parse::<Key>().is_err());
+    }
+
+    #[test]
+    fn build_leap_triggers() {
+        // LeapPinch: bare (hand defaults to Any) and with hand=.
+        let got = build_gesture_trigger("LeapPinch", &GestureTriggerProps::default()).unwrap();
+        assert_eq!(
+            got,
+            Trigger::LeapPinch {
+                hand: LeapHand::Any
+            }
+        );
+        let props = GestureTriggerProps {
+            hand: Some("right"),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_gesture_trigger("LeapPinch", &props).unwrap(),
+            Trigger::LeapPinch {
+                hand: LeapHand::Right
+            }
+        );
+
+        // LeapSwipe requires direction.
+        assert!(build_gesture_trigger("LeapSwipe", &GestureTriggerProps::default()).is_err());
+        let props = GestureTriggerProps {
+            direction: Some("left"),
+            hand: Some("LEFT"),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_gesture_trigger("LeapSwipe", &props).unwrap(),
+            Trigger::LeapSwipe {
+                hand: LeapHand::Left,
+                direction: SwipeDirection::Left,
+            }
+        );
+
+        // LeapGrabDrag requires axis.
+        assert!(build_gesture_trigger("LeapGrabDrag", &GestureTriggerProps::default()).is_err());
+        let props = GestureTriggerProps {
+            axis: Some("vertical"),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_gesture_trigger("LeapGrabDrag", &props).unwrap(),
+            Trigger::LeapGrabDrag {
+                hand: LeapHand::Any,
+                axis: LeapAxis::Vertical,
+            }
+        );
+        let props = GestureTriggerProps {
+            axis: Some("depth"),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_gesture_trigger("LeapGrabDrag", &props).unwrap(),
+            Trigger::LeapGrabDrag {
+                hand: LeapHand::Any,
+                axis: LeapAxis::Depth,
+            }
+        );
+
+        // LeapPresence requires event.
+        assert!(build_gesture_trigger("LeapPresence", &GestureTriggerProps::default()).is_err());
+        let props = GestureTriggerProps {
+            event: Some("appear"),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_gesture_trigger("LeapPresence", &props).unwrap(),
+            Trigger::LeapPresence {
+                hand: LeapHand::Any,
+                event: LeapPresenceEvent::Appear,
+            }
+        );
+
+        // LeapPose requires fingers in 1..=5.
+        assert!(build_gesture_trigger("LeapPose", &GestureTriggerProps::default()).is_err());
+        let props = GestureTriggerProps {
+            fingers: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_gesture_trigger("LeapPose", &props).unwrap(),
+            Trigger::LeapPose {
+                hand: LeapHand::Any,
+                fingers: 3,
+            }
+        );
+        let props = GestureTriggerProps {
+            fingers: Some(1),
+            hand: Some("left"),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_gesture_trigger("LeapPose", &props).unwrap(),
+            Trigger::LeapPose {
+                hand: LeapHand::Left,
+                fingers: 1,
+            }
+        );
+        for out_of_range in [0, 6] {
+            let props = GestureTriggerProps {
+                fingers: Some(out_of_range),
+                ..Default::default()
+            };
+            assert!(build_gesture_trigger("LeapPose", &props).is_err());
+        }
+    }
+
+    #[test]
+    fn leap_triggers_reject_foreign_properties() {
+        // Touch vocabulary on leap families.
+        let props = GestureTriggerProps {
+            fingers: Some(3),
+            ..Default::default()
+        };
+        assert!(build_gesture_trigger("LeapPinch", &props).is_err());
+        let props = GestureTriggerProps {
+            edge: Some("left"),
+            ..Default::default()
+        };
+        assert!(build_gesture_trigger("LeapSwipe", &props).is_err());
+
+        // Leap vocabulary on touch families.
+        let props = GestureTriggerProps {
+            fingers: Some(3),
+            direction: Some("up"),
+            hand: Some("right"),
+            ..Default::default()
+        };
+        assert!(build_gesture_trigger("TouchSwipe", &props).is_err());
+        let props = GestureTriggerProps {
+            fingers: Some(3),
+            direction: Some("up"),
+            axis: Some("vertical"),
+            ..Default::default()
+        };
+        assert!(build_gesture_trigger("TouchpadSwipe", &props).is_err());
+
+        // Wrong leap property for the family.
+        let props = GestureTriggerProps {
+            direction: Some("up"),
+            ..Default::default()
+        };
+        assert!(build_gesture_trigger("LeapPinch", &props).is_err());
+        let props = GestureTriggerProps {
+            axis: Some("vertical"),
+            event: Some("appear"),
+            ..Default::default()
+        };
+        assert!(build_gesture_trigger("LeapGrabDrag", &props).is_err());
+        let props = GestureTriggerProps {
+            fingers: Some(3),
+            direction: Some("up"),
+            ..Default::default()
+        };
+        assert!(build_gesture_trigger("LeapPose", &props).is_err());
+        let props = GestureTriggerProps {
+            fingers: Some(3),
+            ..Default::default()
+        };
+        assert!(build_gesture_trigger("LeapGrabDrag", &props).is_err());
+        assert!(build_gesture_trigger("LeapPresence", &props).is_err());
+
+        // Invalid values.
+        let props = GestureTriggerProps {
+            hand: Some("both"),
+            ..Default::default()
+        };
+        assert!(build_gesture_trigger("LeapPinch", &props).is_err());
+        let props = GestureTriggerProps {
+            axis: Some("diagonal"),
+            ..Default::default()
+        };
+        assert!(build_gesture_trigger("LeapGrabDrag", &props).is_err());
+        let props = GestureTriggerProps {
+            event: Some("hover"),
+            ..Default::default()
+        };
+        assert!(build_gesture_trigger("LeapPresence", &props).is_err());
     }
 
     #[test]
@@ -1617,6 +2072,9 @@ mod tests {
             direction: Some("up"),
             edge: None,
             zone: None,
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert_eq!(
             build_gesture_trigger("TouchSwipe", &props).unwrap(),
@@ -1635,6 +2093,9 @@ mod tests {
                 direction: Some("right"),
                 edge: None,
                 zone: None,
+                hand: None,
+                axis: None,
+                event: None,
             };
             let got = build_gesture_trigger("TouchSwipe", &props).unwrap();
             assert_eq!(
@@ -1655,6 +2116,9 @@ mod tests {
                 direction: Some("up"),
                 edge: None,
                 zone: None,
+                hand: None,
+                axis: None,
+                event: None,
             };
             assert!(
                 build_gesture_trigger("TouchSwipe", &props).is_err(),
@@ -1671,6 +2135,9 @@ mod tests {
             direction: Some("up"),
             edge: None,
             zone: None,
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert!(build_gesture_trigger("TouchSwipe", &swipe_up).is_ok());
         assert!(build_gesture_trigger("TouchPinch", &swipe_up).is_err());
@@ -1682,6 +2149,9 @@ mod tests {
             direction: Some("in"),
             edge: None,
             zone: None,
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert!(build_gesture_trigger("TouchPinch", &pinch_in).is_ok());
         assert!(build_gesture_trigger("TouchpadPinch", &pinch_in).is_ok());
@@ -1694,6 +2164,9 @@ mod tests {
             direction: Some("cw"),
             edge: None,
             zone: None,
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert!(build_gesture_trigger("TouchRotate", &rotate_cw).is_ok());
         assert!(build_gesture_trigger("TouchSwipe", &rotate_cw).is_err());
@@ -1708,6 +2181,9 @@ mod tests {
             direction: Some("in"),
             edge: None,
             zone: None,
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert_eq!(
             build_gesture_trigger("TouchpadPinch", &props).unwrap(),
@@ -1722,6 +2198,9 @@ mod tests {
             direction: Some("out"),
             edge: None,
             zone: None,
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert_eq!(
             build_gesture_trigger("TouchpadPinch", &props).unwrap(),
@@ -1739,6 +2218,9 @@ mod tests {
             direction: None,
             edge: None,
             zone: None,
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert!(build_gesture_trigger("TouchpadPinch", &props).is_err());
     }
@@ -1751,6 +2233,9 @@ mod tests {
                 direction: Some(bad),
                 edge: None,
                 zone: None,
+                hand: None,
+                axis: None,
+                event: None,
             };
             assert!(
                 build_gesture_trigger("TouchpadPinch", &props).is_err(),
@@ -1766,6 +2251,9 @@ mod tests {
             direction: None,
             edge: Some("left"),
             zone: None,
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert_eq!(
             build_gesture_trigger("TouchEdge", &props).unwrap(),
@@ -1784,6 +2272,9 @@ mod tests {
             direction: None,
             edge: Some("top"),
             zone: Some("right"),
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert_eq!(
             build_gesture_trigger("TouchEdge", &props).unwrap(),
@@ -1798,6 +2289,9 @@ mod tests {
             direction: None,
             edge: Some("left"),
             zone: Some("top"),
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert_eq!(
             build_gesture_trigger("TouchEdge", &props).unwrap(),
@@ -1816,6 +2310,9 @@ mod tests {
             direction: None,
             edge: Some("left"),
             zone: Some("left"),
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert!(build_gesture_trigger("TouchEdge", &bad).is_err());
 
@@ -1825,6 +2322,9 @@ mod tests {
             direction: None,
             edge: Some("top"),
             zone: Some("top"),
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert!(build_gesture_trigger("TouchEdge", &bad).is_err());
     }
@@ -1836,6 +2336,9 @@ mod tests {
             direction: None,
             edge: Some("left"),
             zone: None,
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert!(build_gesture_trigger("TouchEdge", &props).is_err());
     }
@@ -1911,6 +2414,97 @@ mod tests {
             }
         );
         assert!(bind.key.modifiers.contains(Modifiers::COMPOSITOR));
+    }
+
+    #[test]
+    fn decode_node_leap_binds() {
+        let cfg = parse_binds(r#"LeapPinch { toggle-overview; }"#);
+        assert_eq!(
+            first_bind(&cfg).key.trigger,
+            Trigger::LeapPinch {
+                hand: LeapHand::Any
+            }
+        );
+
+        let cfg = parse_binds(r#"LeapSwipe hand="right" direction="left" { focus-column-right; }"#);
+        assert_eq!(
+            first_bind(&cfg).key.trigger,
+            Trigger::LeapSwipe {
+                hand: LeapHand::Right,
+                direction: SwipeDirection::Left,
+            }
+        );
+
+        let cfg = parse_binds(r#"LeapGrabDrag axis="vertical" { focus-workspace-up; }"#);
+        assert_eq!(
+            first_bind(&cfg).key.trigger,
+            Trigger::LeapGrabDrag {
+                hand: LeapHand::Any,
+                axis: LeapAxis::Vertical,
+            }
+        );
+
+        let cfg = parse_binds(r#"LeapPresence event="appear" { spawn "notify-send" "hi"; }"#);
+        assert_eq!(
+            first_bind(&cfg).key.trigger,
+            Trigger::LeapPresence {
+                hand: LeapHand::Any,
+                event: LeapPresenceEvent::Appear,
+            }
+        );
+
+        let cfg = parse_binds(r#"LeapPose fingers=3 { focus-workspace 3; }"#);
+        assert_eq!(
+            first_bind(&cfg).key.trigger,
+            Trigger::LeapPose {
+                hand: LeapHand::Any,
+                fingers: 3,
+            }
+        );
+
+        let cfg = parse_binds(r#"LeapPose hand="right" fingers=2 { toggle-overview; }"#);
+        assert_eq!(
+            first_bind(&cfg).key.trigger,
+            Trigger::LeapPose {
+                hand: LeapHand::Right,
+                fingers: 2,
+            }
+        );
+
+        // Modifier layering works like every other gesture family.
+        let cfg = parse_binds(r#"Mod+LeapPinch hand="left" { close-window; }"#);
+        let bind = first_bind(&cfg);
+        assert_eq!(
+            bind.key.trigger,
+            Trigger::LeapPinch {
+                hand: LeapHand::Left
+            }
+        );
+        assert!(bind.key.modifiers.contains(Modifiers::COMPOSITOR));
+    }
+
+    #[test]
+    fn decode_node_leap_bind_rejects_touch_properties() {
+        let err = parse_binds_err(r#"LeapPinch fingers=3 { toggle-overview; }"#);
+        assert!(
+            err.contains("does not accept a `fingers=` property"),
+            "unexpected error: {err}"
+        );
+
+        let err = parse_binds_err(r#"TouchSwipe fingers=3 direction="up" hand="left" { noop; }"#);
+        assert!(
+            err.contains("does not accept a `hand=` property"),
+            "unexpected error: {err}"
+        );
+
+        // LeapPose accepts fingers= but only within one hand's worth.
+        let err = parse_binds_err(r#"LeapPose fingers=6 { noop; }"#);
+        assert!(err.contains("out of range"), "unexpected error: {err}");
+        let err = parse_binds_err(r#"LeapPose { noop; }"#);
+        assert!(
+            err.contains("requires `fingers=N`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2032,6 +2626,9 @@ mod tests {
             direction: Some("up"),
             edge: None,
             zone: None,
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert!(
             build_gesture_trigger("TouchpadTapHold", &props).is_err(),
@@ -2047,6 +2644,9 @@ mod tests {
                 direction: None,
                 edge: None,
                 zone: None,
+                hand: None,
+                axis: None,
+                event: None,
             };
             assert!(
                 build_gesture_trigger("TouchpadTapHold", &props).is_err(),
@@ -2083,6 +2683,9 @@ mod tests {
             direction: Some("up"),
             edge: None,
             zone: None,
+            hand: None,
+            axis: None,
+            event: None,
         };
         assert!(
             build_gesture_trigger("TouchpadTapHoldDrag", &props).is_err(),

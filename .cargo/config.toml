@@ -1,0 +1,9 @@
+# Build-time link search path for the `leap` cargo feature.
+#
+# leaprs's build script reads LEAPSDK_LIB_PATH to find libLeapC.so. The
+# Arch `ultraleap-hand-tracking-service` package installs it outside the
+# default linker path (runtime loading is already covered by the
+# package's /etc/ld.so.conf.d entry). Harmless when the feature is off,
+# and only sets the variable if it isn't set in the environment already.
+[env]
+LEAPSDK_LIB_PATH = "/usr/lib/ultraleap-hand-tracking-service"

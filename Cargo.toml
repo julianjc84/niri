@@ -75,6 +75,7 @@ git-version = "0.3.9"
 glam = "0.32.1"
 input = { version = "0.10.0", features = ["libinput_1_21"] }
 keyframe = { version = "1.1.1", default-features = false }
+leaprs = { version = "0.2.2", optional = true }
 libc = "0.2.185"
 libdisplay-info = "0.3.0"
 log = { version = "0.4.29", features = ["max_level_trace", "release_max_level_debug"] }
@@ -146,6 +147,9 @@ profile-with-tracy-ondemand = ["profile-with-tracy", "tracy-client/ondemand", "t
 profile-with-tracy-allocations = ["profile-with-tracy"]
 # Enables dinit integration (global environment).
 dinit = []
+# Enables Ultraleap (Leap Motion) hand tracking as an input source.
+# Links the proprietary libLeapC.so at build time (Ultraleap Gemini SDK).
+leap = ["dep:leaprs"]
 
 [lints.clippy]
 new_without_default = "allow"

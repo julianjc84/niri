@@ -17,6 +17,7 @@ pub struct Input {
     pub trackball: Trackball,
     pub tablet: Tablet,
     pub touchscreen: Touchscreen,
+    pub leap: Leap,
     pub disable_power_key_handling: bool,
     pub warp_mouse_to_focus: Option<WarpMouseToFocus>,
     pub focus_follows_mouse: Option<FocusFollowsMouse>,
@@ -41,6 +42,8 @@ pub struct InputPart {
     pub tablet: Option<Tablet>,
     #[knuffel(child)]
     pub touchscreen: Option<Touchscreen>,
+    #[knuffel(child)]
+    pub leap: Option<Leap>,
     #[knuffel(child)]
     pub disable_power_key_handling: Option<Flag>,
     #[knuffel(child)]
@@ -72,6 +75,7 @@ impl MergeWith<InputPart> for Input {
             trackball,
             tablet,
             touchscreen,
+            leap,
         );
 
         merge_clone_opt!(
@@ -534,6 +538,265 @@ impl Touchscreen {
     }
 }
 
+/// Ultraleap (Leap Motion) hand-tracking input.
+///
+/// Only meaningful when niri is built with the `leap` cargo feature; the
+/// config parses either way so a shared config file doesn't break
+/// non-leap builds. The gesture binds (`LeapPinch`, `LeapSwipe
+/// direction="left"`, `LeapGrabDrag axis="vertical"`, `LeapPresence
+/// event="appear"`) live in the main `binds {}` block — this struct only
+/// tunes recognition.
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct Leap {
+    #[knuffel(child)]
+    pub off: bool,
+    /// Debug aid: send a desktop notification for every recognized leap
+    /// gesture (in addition to running whatever it's bound to). Discrete
+    /// events plus grab begin/end — not per-frame grab updates.
+    #[knuffel(child)]
+    pub notify_gestures: bool,
+    #[knuffel(child)]
+    pub gestures: Option<LeapGesturesConfig>,
+}
+
+impl Leap {
+    /// Pinch strength (0..1 from the tracking service) at which a
+    /// `LeapPinch` bind fires. Default 0.8.
+    pub fn pinch_trigger_strength(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.pinch_trigger_strength)
+            .unwrap_or(0.8)
+    }
+
+    /// Pinch strength below which the pinch re-arms (hysteresis floor;
+    /// must be below the trigger strength). Default 0.4.
+    pub fn pinch_release_strength(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.pinch_release_strength)
+            .unwrap_or(0.4)
+    }
+
+    /// Palm speed (mm/s) along a screen axis at which a `LeapSwipe`
+    /// bind fires. Default 400.
+    pub fn swipe_trigger_speed(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.swipe_trigger_speed)
+            .unwrap_or(400.0)
+    }
+
+    /// Palm speed (mm/s) below which swipe detection re-arms after
+    /// firing. Default 100.
+    pub fn swipe_rearm_speed(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.swipe_rearm_speed)
+            .unwrap_or(100.0)
+    }
+
+    /// Multiplier applied to `swipe_trigger_speed` for vertical swipes.
+    /// Vertical palm motion is how hands enter and leave the sensor's
+    /// view cone, so it false-triggers far more easily than horizontal —
+    /// a raised threshold compensates. Default 1.5.
+    pub fn swipe_vertical_scale(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.swipe_vertical_scale)
+            .unwrap_or(1.5)
+    }
+
+    /// Return-stroke window (ms): after a swipe fires, an
+    /// opposite-direction swipe within this window is treated as the
+    /// hand winding back for another stroke and swallowed. Makes
+    /// swipe-swipe-swipe chains in one direction possible. Costs the
+    /// ability to genuinely reverse direction within the window; set 0
+    /// to disable. Default 400.
+    pub fn swipe_return_window_ms(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.swipe_return_window_ms)
+            .unwrap_or(400.0)
+    }
+
+    /// Grab strength (0..1) at which a `LeapGrabDrag` gesture latches.
+    /// Default 0.8.
+    pub fn grab_trigger_strength(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.grab_trigger_strength)
+            .unwrap_or(0.8)
+    }
+
+    /// Grab strength below which an active grab-drag ends. Default 0.4.
+    pub fn grab_release_strength(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.grab_release_strength)
+            .unwrap_or(0.4)
+    }
+
+    /// Palm displacement (mm) that maps to gesture progress 1.0 during a
+    /// grab-drag. Default 150.
+    pub fn grab_drag_distance(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.grab_drag_distance)
+            .unwrap_or(150.0)
+    }
+
+    /// Palm displacement (mm) from the fist closing at which the drag
+    /// axis locks (horizontal vs vertical, from the dominant component).
+    /// Smaller = locks sooner and feels snappier, but fist wobble can
+    /// pick the wrong axis; larger = more deliberate movement required.
+    /// Default 15.
+    pub fn grab_axis_latch_distance(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.grab_axis_latch_distance)
+            .unwrap_or(15.0)
+    }
+
+    /// Settle delay (ms) between the fist closing and the drag anchor
+    /// being captured. Curling fingers into a fist shifts the tracker's
+    /// palm-center estimate vertically, so anchoring at the trigger
+    /// instant starts the drag with phantom vertical displacement —
+    /// which makes the axis latch vertical almost every time. Default 100.
+    pub fn grab_settle_ms(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.grab_settle_ms)
+            .unwrap_or(100.0)
+    }
+
+    /// Vertical bias factor in the grab axis race: vertical displacement
+    /// is divided by this before comparing against the other axes, so
+    /// values above 1.0 make vertical harder to latch — compensating for
+    /// the vertical drift inherent in fist motion. Default 1.5.
+    pub fn grab_vertical_scale(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.grab_vertical_scale)
+            .unwrap_or(1.5)
+    }
+
+    /// Depth (forward/back) bias factor in the grab axis race, same
+    /// mechanics as `grab-vertical-scale`: forward/back displacement is
+    /// divided by this before the comparison, so values above 1.0 make
+    /// depth harder to latch and values below 1.0 make it easier.
+    /// Default 1.0 (neutral).
+    pub fn grab_depth_scale(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.grab_depth_scale)
+            .unwrap_or(1.0)
+    }
+
+    /// Debounce (ms) for `LeapPresence` events — a hand must be
+    /// continuously present/absent this long before appear/vanish fires.
+    /// Filters tracking flicker at the sensor's view edge. Default 250.
+    pub fn presence_debounce_ms(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.presence_debounce_ms)
+            .unwrap_or(250.0)
+    }
+
+    /// Settle time (ms) for `LeapPose` binds — the extended-finger count
+    /// must hold steady this long (on a still palm) before the pose
+    /// fires. Filters the intermediate counts a hand passes through
+    /// while fingers unfold (fist → 3 fingers crosses 1 and 2 on the
+    /// way). Default 150.
+    pub fn pose_settle_ms(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.pose_settle_ms)
+            .unwrap_or(150.0)
+    }
+
+    /// Maximum planar palm speed (mm/s) at which a `LeapPose` can settle.
+    /// A moving hand is a swipe or a drag, not a held-up pose; the
+    /// stillness gate is what keeps the two vocabularies from colliding.
+    /// Default 120.
+    pub fn pose_max_speed(&self) -> f64 {
+        self.gestures
+            .as_ref()
+            .and_then(|g| g.pose_max_speed)
+            .unwrap_or(120.0)
+    }
+}
+
+/// Tuning parameters for Leap Motion gesture recognition.
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct LeapGesturesConfig {
+    /// Pinch strength (0..1) at which `LeapPinch` fires. Default: 0.8.
+    #[knuffel(child, unwrap(argument))]
+    pub pinch_trigger_strength: Option<f64>,
+    /// Pinch strength below which the pinch re-arms. Hysteresis floor —
+    /// keep well below the trigger strength or a hovering hand will
+    /// machine-gun the action. Default: 0.4.
+    #[knuffel(child, unwrap(argument))]
+    pub pinch_release_strength: Option<f64>,
+    /// Palm speed (mm/s) at which `LeapSwipe` fires. Default: 400.0.
+    #[knuffel(child, unwrap(argument))]
+    pub swipe_trigger_speed: Option<f64>,
+    /// Palm speed (mm/s) below which swipe detection re-arms.
+    /// Default: 100.0.
+    #[knuffel(child, unwrap(argument))]
+    pub swipe_rearm_speed: Option<f64>,
+    /// Multiplier on `swipe-trigger-speed` for vertical swipes (hands
+    /// enter/leave the view vertically, so vertical false-triggers more
+    /// easily). Default: 1.5.
+    #[knuffel(child, unwrap(argument))]
+    pub swipe_vertical_scale: Option<f64>,
+    /// Return-stroke window in ms: opposite-direction swipes within this
+    /// long after a fire are swallowed as wind-back strokes. 0 disables.
+    /// Default: 400.
+    #[knuffel(child, unwrap(argument))]
+    pub swipe_return_window_ms: Option<f64>,
+    /// Grab strength (0..1) at which `LeapGrabDrag` latches.
+    /// Default: 0.8.
+    #[knuffel(child, unwrap(argument))]
+    pub grab_trigger_strength: Option<f64>,
+    /// Grab strength below which an active grab-drag ends. Default: 0.4.
+    #[knuffel(child, unwrap(argument))]
+    pub grab_release_strength: Option<f64>,
+    /// Palm displacement (mm) mapping to progress 1.0 in a grab-drag.
+    /// Default: 150.0.
+    #[knuffel(child, unwrap(argument))]
+    pub grab_drag_distance: Option<f64>,
+    /// Palm displacement (mm) from fist-close at which the drag axis
+    /// locks. Default: 15.0.
+    #[knuffel(child, unwrap(argument))]
+    pub grab_axis_latch_distance: Option<f64>,
+    /// Settle delay (ms) between fist-close and drag-anchor capture,
+    /// letting the palm-position shift from finger curling die down.
+    /// Default: 100.0.
+    #[knuffel(child, unwrap(argument))]
+    pub grab_settle_ms: Option<f64>,
+    /// Vertical bias factor in the axis race: vertical displacement is
+    /// divided by this before comparing against the other axes.
+    /// Default: 1.5.
+    #[knuffel(child, unwrap(argument))]
+    pub grab_vertical_scale: Option<f64>,
+    /// Depth (forward/back) bias factor in the axis race, same
+    /// mechanics. Default: 1.0.
+    #[knuffel(child, unwrap(argument))]
+    pub grab_depth_scale: Option<f64>,
+    /// Presence debounce in milliseconds. Default: 250.0.
+    #[knuffel(child, unwrap(argument))]
+    pub presence_debounce_ms: Option<f64>,
+    /// Settle time (ms) a stable extended-finger count must hold before
+    /// a `LeapPose` fires. Default: 150.0.
+    #[knuffel(child, unwrap(argument))]
+    pub pose_settle_ms: Option<f64>,
+    /// Maximum planar palm speed (mm/s) for a pose to settle — moving
+    /// hands are swipes/drags, not poses. Default: 120.0.
+    #[knuffel(child, unwrap(argument))]
+    pub pose_max_speed: Option<f64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScreenEdge {
     Left,
@@ -859,6 +1122,53 @@ mod tests {
             .map_err(miette::Report::new)
             .unwrap();
         Input::from_part(&part)
+    }
+
+    #[test]
+    fn parse_leap_gestures_config() {
+        // Defaults when the block is absent entirely.
+        let parsed = do_parse("");
+        assert_eq!(parsed.leap.pinch_trigger_strength(), 0.8);
+        assert_eq!(parsed.leap.pinch_release_strength(), 0.4);
+        assert_eq!(parsed.leap.swipe_trigger_speed(), 400.0);
+        assert_eq!(parsed.leap.swipe_rearm_speed(), 100.0);
+        assert_eq!(parsed.leap.grab_trigger_strength(), 0.8);
+        assert_eq!(parsed.leap.grab_release_strength(), 0.4);
+        assert_eq!(parsed.leap.grab_drag_distance(), 150.0);
+        assert_eq!(parsed.leap.grab_depth_scale(), 1.0);
+        assert_eq!(parsed.leap.presence_debounce_ms(), 250.0);
+        assert_eq!(parsed.leap.pose_settle_ms(), 150.0);
+        assert_eq!(parsed.leap.pose_max_speed(), 120.0);
+        assert!(!parsed.leap.off);
+
+        // Overrides.
+        let parsed = do_parse(
+            r#"
+            leap {
+                gestures {
+                    pinch-trigger-strength 0.9
+                    swipe-trigger-speed 600.0
+                    grab-drag-distance 200.0
+                    grab-depth-scale 1.3
+                    pose-settle-ms 300.0
+                    pose-max-speed 80.0
+                }
+            }
+            "#,
+        );
+        assert_eq!(parsed.leap.pinch_trigger_strength(), 0.9);
+        assert_eq!(parsed.leap.swipe_trigger_speed(), 600.0);
+        assert_eq!(parsed.leap.grab_drag_distance(), 200.0);
+        assert_eq!(parsed.leap.grab_depth_scale(), 1.3);
+        assert_eq!(parsed.leap.pose_settle_ms(), 300.0);
+        assert_eq!(parsed.leap.pose_max_speed(), 80.0);
+        // Untouched knobs keep their defaults.
+        assert_eq!(parsed.leap.pinch_release_strength(), 0.4);
+        assert_eq!(parsed.leap.presence_debounce_ms(), 250.0);
+
+        // off flag.
+        let parsed = do_parse("leap { off; }");
+        assert!(parsed.leap.off);
     }
 
     #[test]

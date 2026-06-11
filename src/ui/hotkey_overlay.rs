@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use niri_config::input::{EdgeZone, ScreenEdge};
 use niri_config::{
-    Action, Bind, Config, Key, ModKey, Modifiers, PinchDirection, RotateDirection, SwipeDirection,
-    Trigger,
+    Action, Bind, Config, Key, LeapAxis, LeapHand, LeapPresenceEvent, ModKey, Modifiers,
+    PinchDirection, RotateDirection, SwipeDirection, Trigger,
 };
 use pangocairo::cairo::{self, ImageSurface};
 use pangocairo::pango::{AttrColor, AttrInt, AttrList, AttrString, FontDescription, Weight};
@@ -614,10 +614,50 @@ fn key_name(screen_reader: bool, mod_key: ModKey, key: &Key) -> String {
             None => format!("Touch {fingers}-Finger Tap-Hold-Drag"),
         },
         Trigger::TouchEdge { edge, zone } => format_touch_edge_label(edge, zone),
+        Trigger::LeapPinch { hand } => format!("{}Air Pinch", leap_hand_label(hand)),
+        Trigger::LeapSwipe { hand, direction } => format!(
+            "{}Air Swipe {}",
+            leap_hand_label(hand),
+            swipe_dir_label(direction)
+        ),
+        Trigger::LeapGrabDrag { hand, axis } => format!(
+            "{}Air Grab-Drag {}",
+            leap_hand_label(hand),
+            leap_axis_label(axis)
+        ),
+        Trigger::LeapPresence { hand, event } => format!(
+            "{}Hand {}",
+            leap_hand_label(hand),
+            match event {
+                LeapPresenceEvent::Appear => "Appears",
+                LeapPresenceEvent::Vanish => "Vanishes",
+            }
+        ),
+        Trigger::LeapPose { hand, fingers } => format!(
+            "{}Air Pose {fingers}-Finger{}",
+            leap_hand_label(hand),
+            if fingers == 1 { "" } else { "s" }
+        ),
     };
     name.push_str(&pretty);
 
     name
+}
+
+fn leap_hand_label(hand: LeapHand) -> &'static str {
+    match hand {
+        LeapHand::Any => "",
+        LeapHand::Left => "Left-Hand ",
+        LeapHand::Right => "Right-Hand ",
+    }
+}
+
+fn leap_axis_label(axis: LeapAxis) -> &'static str {
+    match axis {
+        LeapAxis::Horizontal => "Horizontal",
+        LeapAxis::Vertical => "Vertical",
+        LeapAxis::Depth => "Forward/Back",
+    }
 }
 
 fn swipe_dir_label(d: SwipeDirection) -> &'static str {

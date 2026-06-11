@@ -465,6 +465,10 @@ pub struct Niri {
     pub gesture_swipe_3f_cumulative: Option<(f64, f64, usize)>,
     /// Active touchpad swipe gesture from binds.
     pub gesture_swipe_bind: Option<ActiveSwipeBind>,
+    /// Leap Motion hand-tracking gesture recognition state.
+    pub leap_gesture_state: crate::input::leap_gesture::LeapGestureState,
+    /// Active leap grab-drag bind driving a continuous gesture.
+    pub leap_grab_bind: Option<ActiveSwipeBind>,
     /// Active touch points for multi-finger gesture detection.
     pub touch_gesture_points: HashMap<Option<TouchSlot>, Point<f64, Logical>>,
     /// Cumulative delta when tracking a 2+ finger touch gesture.
@@ -2668,6 +2672,22 @@ impl Niri {
             )
             .unwrap();
 
+        // Leap Motion hand tracking. Spawned only when enabled at startup,
+        // because connecting to the tracking service powers up the device
+        // (IR LEDs + cameras); toggling `input.leap.off` therefore needs a
+        // niri restart to take effect.
+        #[cfg(feature = "leap")]
+        if !config_.input.leap.off {
+            let channel = crate::input::leap_gesture::source::start();
+            event_loop
+                .insert_source(channel, |event, _, state| {
+                    if let calloop::channel::Event::Msg(frame) = event {
+                        state.on_leap_frame(frame);
+                    }
+                })
+                .unwrap();
+        }
+
         drop(config_);
         let mut niri = Self {
             config,
@@ -2769,6 +2789,8 @@ impl Niri {
             tablet_cursor_location: None,
             gesture_swipe_3f_cumulative: None,
             gesture_swipe_bind: None,
+            leap_gesture_state: Default::default(),
+            leap_grab_bind: None,
             touch_gesture_points: HashMap::new(),
             touch_gesture_cumulative: None,
             touch_edge_swipe: None,

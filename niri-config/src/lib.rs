@@ -1133,6 +1133,11 @@ mod tests {
                     ),
                     gestures: None,
                 },
+                leap: Leap {
+                    off: false,
+                    notify_gestures: false,
+                    gestures: None,
+                },
                 disable_power_key_handling: true,
                 warp_mouse_to_focus: Some(
                     WarpMouseToFocus {
