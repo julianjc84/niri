@@ -67,6 +67,8 @@ binds {
 }
 ```
 
+`direction` names the physical direction your fingers travel, regardless of the touchpad's `natural-scroll` setting.
+
 Tuning parameters for touchpad gesture recognition (`swipe-trigger-distance`, `pinch-trigger-scale`) live in the `input { touchpad { gestures { } } }` subblock — see [Configuration: Input](./Configuration:-Input.md#touchpad-gesture-tuning).
 
 #### Workspace Switch

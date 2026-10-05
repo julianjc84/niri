@@ -4112,10 +4112,13 @@ impl State {
             config.input.touchpad.swipe_trigger_distance()
         };
 
-        // Apply natural scroll from device (for direction detection during cumulative phase).
+        // Apply natural scroll from device: it steers the workspace and view
+        // animations, like upstream.
         let device = event.device();
+        let mut natural_scroll = false;
         if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
             if device.config_scroll_natural_scroll_enabled() {
+                natural_scroll = true;
                 delta_x = -delta_x;
                 delta_y = -delta_y;
             }
@@ -4131,7 +4134,9 @@ impl State {
             if cx * cx + cy * cy >= threshold * threshold {
                 self.niri.gesture_swipe_3f_cumulative = None;
 
-                // Look up bind for this swipe direction + finger count.
+                // Look up bind for this swipe direction + finger count. Bind
+                // directions name physical finger travel, so undo natural scroll.
+                let (cx, cy) = if natural_scroll { (-cx, -cy) } else { (cx, cy) };
                 let is_horizontal = cx.abs() > cy.abs();
                 let trigger = swipe_trigger(fingers, is_horizontal, cx, cy);
                 if let Some(trigger) = trigger {
