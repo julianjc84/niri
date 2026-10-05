@@ -508,8 +508,8 @@ impl State {
 
         // Spread basis rebase on finger-lift (recognition phase only).
         //
-        // `spread_change = (current_spread - initial_spread).abs()` is the
-        // signal pinch recognition latches on. When a finger lifts during
+        // `|current_spread - initial_spread|` is the signal pinch
+        // recognition latches on. When a finger lifts during
         // recognition, `current_spread` jumps because the geometry changed,
         // not because fingers moved — and the jump typically exceeds
         // `pinch_trigger_distance` immediately, causing a spurious
@@ -573,6 +573,13 @@ impl State {
                     }
                 }
             }
+
+            tracing::debug!(
+                target: "niri::input::touch_gesture",
+                "TOUCH-DBG END locked={} passthrough={}",
+                self.niri.touch_gesture_locked,
+                self.niri.touchscreen_gesture_passthrough,
+            );
 
             self.niri.touch_gesture_cumulative = None;
             self.niri.touch_gesture_locked = false;
@@ -1067,7 +1074,11 @@ impl State {
                         .niri
                         .touch_gesture_initial_spread
                         .unwrap_or(current_spread);
-                    let spread_change = (current_spread - initial_spread).abs();
+                    // Signed: negative = pinch-in, positive = pinch-out. Only
+                    // the magnitude is classified on; the sign is carried for
+                    // direction display in debug telemetry.
+                    let spread_change = current_spread - initial_spread;
+                    let spread_magnitude = spread_change.abs();
 
                     let cumulative_rotation = self.niri.touch_gesture_cumulative_rotation;
                     let rotation_arc = cumulative_rotation.abs() * current_spread;
@@ -1076,15 +1087,15 @@ impl State {
                     let is_rotate = finger_count >= 3
                         && rotation_arc >= rotation_arc_trigger_distance
                         && rotation_arc >= swipe_distance * rotation_dom
-                        && rotation_arc >= spread_change * rotation_dom;
+                        && rotation_arc >= spread_magnitude * rotation_dom;
 
-                    let is_pinch = spread_change > pinch_trigger
-                        && spread_change > swipe_distance * pinch_dom
+                    let is_pinch = spread_magnitude > pinch_trigger
+                        && spread_magnitude > swipe_distance * pinch_dom
                         && !is_rotate;
 
                     let closest = {
                         let swipe_frac = swipe_distance / swipe_trigger.max(1e-9);
-                        let pinch_frac = spread_change / pinch_trigger.max(1e-9);
+                        let pinch_frac = spread_magnitude / pinch_trigger.max(1e-9);
                         let rotate_frac = cumulative_rotation.abs() / rotation_trigger.max(1e-9);
                         if rotate_frac >= swipe_frac && rotate_frac >= pinch_frac {
                             "rotate"
@@ -1100,14 +1111,14 @@ impl State {
                          swipe={:.1}/{:.1} \
                          spread={:.1}/{:.1} \
                          rot={:.3}/{:.3}rad ({:.1}°) \
-                         arc={:.1} \
+                         arc={:.1}/{:.1} \
                          is_rotate={} is_pinch={} closest={}",
                         finger_count,
                         swipe_distance, swipe_trigger,
                         spread_change, pinch_trigger,
-                        cumulative_rotation.abs(), rotation_trigger,
+                        cumulative_rotation, rotation_trigger,
                         cumulative_rotation.to_degrees(),
-                        rotation_arc,
+                        rotation_arc, rotation_arc_trigger_distance,
                         is_rotate, is_pinch, closest,
                     );
 
