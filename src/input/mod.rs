@@ -4044,7 +4044,13 @@ impl State {
                             // No compositor animation.
                         }
                     }
-                    self.niri.gesture_swipe_bind = Some(ActiveSwipeBind { kind, sensitivity });
+                    // No travel direction yet: swiping up performs the action.
+                    let sign = overview_action_sign(&bind.action, is_overview_open);
+                    self.niri.gesture_swipe_bind = Some(ActiveSwipeBind {
+                        kind,
+                        sensitivity,
+                        overview_forward: (0., -sign),
+                    });
                 } else {
                     // Discrete action — fire once.
                     self.do_action(bind.action, bind.allow_when_locked);
@@ -4104,7 +4110,7 @@ impl State {
             delta_y = libinput_event.dy_unaccelerated();
         }
 
-        let uninverted_delta_y = delta_y;
+        let (physical_delta_x, physical_delta_y) = (delta_x, delta_y);
 
         // Read swipe trigger distance from touchpad config.
         let threshold = {
@@ -4197,8 +4203,13 @@ impl State {
                                     // No compositor animation.
                                 }
                             }
-                            self.niri.gesture_swipe_bind =
-                                Some(ActiveSwipeBind { kind, sensitivity });
+                            let sign = overview_action_sign(&bind.action, is_overview_open);
+                            let (fx, fy) = dominant_axis(cx, cy);
+                            self.niri.gesture_swipe_bind = Some(ActiveSwipeBind {
+                                kind,
+                                sensitivity,
+                                overview_forward: (fx * sign, fy * sign),
+                            });
                         } else {
                             // Discrete action — fire once.
                             if !matches!(bind.action, Action::Noop) {
@@ -4217,6 +4228,7 @@ impl State {
         if let Some(ref bind) = self.niri.gesture_swipe_bind {
             let kind = bind.kind;
             let sensitivity = bind.sensitivity;
+            let (forward_x, forward_y) = bind.overview_forward;
             let mut handled = false;
             match kind {
                 ContinuousGestureKind::WorkspaceSwitch => {
@@ -4246,10 +4258,11 @@ impl State {
                     }
                 }
                 ContinuousGestureKind::OverviewToggle => {
+                    let travel = physical_delta_x * forward_x + physical_delta_y * forward_y;
                     let res = self
                         .niri
                         .layout
-                        .overview_gesture_update(-uninverted_delta_y * sensitivity, timestamp);
+                        .overview_gesture_update(travel * sensitivity, timestamp);
                     if let Some(redraw) = res {
                         if redraw {
                             self.niri.queue_redraw_all();
@@ -5320,6 +5333,25 @@ pub fn mods_with_tablet_stylus_binds(mod_key: ModKey, binds: &Binds) -> HashSet<
     )
 }
 
+/// Sign for travel along a bound gesture's direction so that it performs the
+/// overview `action`: `1.` opens the overview, `-1.` closes it.
+fn overview_action_sign(action: &Action, is_overview_open: bool) -> f64 {
+    match action {
+        Action::CloseOverview => -1.,
+        Action::ToggleOverview if is_overview_open => -1.,
+        _ => 1.,
+    }
+}
+
+/// Unit vector along the dominant axis of a swipe, in screen coordinates.
+fn dominant_axis(cx: f64, cy: f64) -> (f64, f64) {
+    if cx.abs() > cy.abs() {
+        (cx.signum(), 0.)
+    } else {
+        (0., cy.signum())
+    }
+}
+
 fn swipe_trigger(fingers: usize, is_horizontal: bool, cx: f64, cy: f64) -> Option<Trigger> {
     let Ok(fingers_u8) = u8::try_from(fingers) else {
         return None;
@@ -5390,6 +5422,24 @@ fn make_binds_iter<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overview_sign_follows_action() {
+        assert_eq!(overview_action_sign(&Action::OpenOverview, false), 1.);
+        assert_eq!(overview_action_sign(&Action::OpenOverview, true), 1.);
+        assert_eq!(overview_action_sign(&Action::CloseOverview, false), -1.);
+        assert_eq!(overview_action_sign(&Action::CloseOverview, true), -1.);
+        assert_eq!(overview_action_sign(&Action::ToggleOverview, false), 1.);
+        assert_eq!(overview_action_sign(&Action::ToggleOverview, true), -1.);
+    }
+
+    #[test]
+    fn dominant_axis_picks_larger_component() {
+        assert_eq!(dominant_axis(3., -1.), (1., 0.));
+        assert_eq!(dominant_axis(-3., 1.), (-1., 0.));
+        assert_eq!(dominant_axis(1., -3.), (0., -1.));
+        assert_eq!(dominant_axis(1., 3.), (0., 1.));
+    }
 
     #[test]
     fn comp_mod_handling() {

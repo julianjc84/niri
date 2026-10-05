@@ -244,6 +244,9 @@ pub enum TouchEdgeSwipeState {
         kind: ContinuousGestureKind,
         sensitivity: f64,
         natural_scroll: bool,
+        /// Travel direction that opens the overview; see
+        /// `ActiveTouchBind::Swipe::overview_forward`.
+        overview_forward: (f64, f64),
         slot: Option<TouchSlot>,
     },
 }
@@ -252,6 +255,9 @@ pub enum TouchEdgeSwipeState {
 pub struct ActiveSwipeBind {
     pub kind: ContinuousGestureKind,
     pub sensitivity: f64,
+    /// Physical travel direction that opens the overview; see
+    /// `ActiveTouchBind::Swipe::overview_forward`.
+    pub overview_forward: (f64, f64),
 }
 
 /// State for an active multi-finger touch gesture (after bind matched).
@@ -266,6 +272,10 @@ pub enum ActiveTouchBind {
         kind: ContinuousGestureKind,
         sensitivity: f64,
         natural_scroll: bool,
+        /// Unit travel direction that opens the overview: the direction the
+        /// swipe locked in, negated when the bound action closes it. Only
+        /// read for `OverviewToggle`.
+        overview_forward: (f64, f64),
     },
     Pinch {
         kind: ContinuousGestureKind,
@@ -273,9 +283,17 @@ pub enum ActiveTouchBind {
         /// current spread to produce the incremental delta that drives the
         /// animation.
         last_spread: f64,
+        /// Sign applied to spread growth so that continuing the pinch
+        /// performs the bound overview action. Only read for
+        /// `OverviewToggle`.
+        overview_sign: f64,
     },
     Rotate {
         kind: ContinuousGestureKind,
+        /// Sign applied to CCW rotation so that continuing the rotation
+        /// performs the bound overview action. Only read for
+        /// `OverviewToggle`.
+        overview_sign: f64,
     },
 }
 

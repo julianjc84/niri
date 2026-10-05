@@ -62,12 +62,14 @@ binds {
     TouchpadSwipe fingers=3 direction="down"  { focus-workspace-down; }
     TouchpadSwipe fingers=3 direction="left"  { focus-column-right; }
     TouchpadSwipe fingers=3 direction="right" { focus-column-left; }
-    TouchpadSwipe fingers=4 direction="up"    { toggle-overview; }
-    TouchpadSwipe fingers=4 direction="down"  { toggle-overview; }
+    TouchpadSwipe fingers=4 direction="up"    { open-overview; }
+    TouchpadSwipe fingers=4 direction="down"  { close-overview; }
 }
 ```
 
 `direction` names the physical direction your fingers travel, regardless of the touchpad's `natural-scroll` setting.
+
+For the overview actions, moving in the bind's direction performs the action and moving back reverses it: `open-overview` opens, `close-overview` closes, and `toggle-overview` does whichever applies when the gesture starts. This holds for every continuous gesture family, on the touchpad and the touchscreen, and a bind's `natural-scroll=true` property does not change it.
 
 Tuning parameters for touchpad gesture recognition (`swipe-trigger-distance`, `pinch-trigger-scale`) live in the `input { touchpad { gestures { } } }` subblock — see [Configuration: Input](./Configuration:-Input.md#touchpad-gesture-tuning).
 
@@ -167,8 +169,8 @@ binds {
     TouchSwipe fingers=3 direction="down"  { focus-workspace-down; }
     TouchSwipe fingers=3 direction="left"  { focus-column-right; }
     TouchSwipe fingers=3 direction="right" { focus-column-left; }
-    TouchSwipe fingers=4 direction="up"    { toggle-overview; }
-    TouchSwipe fingers=4 direction="down"  { toggle-overview; }
+    TouchSwipe fingers=4 direction="up"    { open-overview; }
+    TouchSwipe fingers=4 direction="down"  { close-overview; }
     // fingers=5 (and 6..=10) also work.
 }
 ```
@@ -298,17 +300,16 @@ The edge trigger zone width is set by `edge-start-distance` in the `touchscreen 
 
 ##### Edge swipes with continuous actions (overview, workspace switch)
 
-Edge swipes can be bound to continuous actions like `toggle-overview` or `focus-workspace-up`. Two things to be aware of:
+Edge swipes can be bound to continuous actions like `toggle-overview` or `focus-workspace-up`.
 
-- **Direction inversion:** Edge swipes feeding into overview require `natural-scroll=true` to feel correct. Without it, swiping down from the top edge tries to close overview instead of opening it.
+For the overview actions an edge swipe travels inward from its edge, and that inward motion performs the action. All four edges work:
 
-  ```kdl
-  binds {
-      TouchEdge edge="top" zone="right" natural-scroll=true { toggle-overview; }
-  }
-  ```
-
-- **Left/right edges and overview:** Continuous overview gestures currently only track vertical (`delta_y`) motion. Left and right edge swipes produce primarily horizontal motion (`delta_x`), which the overview ignores. This means `toggle-overview` on a left or right edge swipe will not work. Use top or bottom edges for overview binds. This is a known limitation.
+```kdl
+binds {
+    TouchEdge edge="top" zone="right" { toggle-overview; }
+    TouchEdge edge="left" zone="top"  { open-overview; }
+}
+```
 
 ##### Edge zones
 
