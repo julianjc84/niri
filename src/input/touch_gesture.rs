@@ -194,7 +194,7 @@ impl State {
         // a locked gesture (direction decided), or an edge swipe. If so,
         // this event is not forwarded to the client. If earlier fingers
         // in the same sequence WERE forwarded (first two fingers pre-
-        // transition), they are terminated via `up` + `wl_touch.cancel`
+        // transition), they are terminated via `wl_touch.cancel`
         // at the transition in the `else` branch below so the client
         // doesn't hold them as phantom down touches.
         // Passthrough mode overrides — when set, the whole gesture
@@ -389,11 +389,10 @@ impl State {
             // The sequence is now claimed as a compositor gesture — drop any
             // deferred tap-to-focus so the gesture leaves focus untouched.
             self.niri.touch_pending_activation = None;
-            // Transition into gesture tracking — if earlier fingers in this
-            // sequence were already forwarded to a client as wl_touch.down,
-            // their matching .up events will be suppressed by this same
-            // gate. Emit explicit wl_touch.up for each forwarded slot AND
-            // wl_touch.cancel so the client can't hold them as phantoms.
+            // Earlier fingers of this sequence may already be down on a
+            // client. Cancel them: Smithay only delivers wl_touch.cancel to
+            // slots with an event in the current frame, so mark each with a
+            // no-op motion first. A touch-up here would read as a tap.
             if !self.niri.touch_forwarded_slots.is_empty() {
                 let forwarded: Vec<_> = self.niri.touch_forwarded_slots.drain().collect();
                 tracing::debug!(
@@ -404,18 +403,21 @@ impl State {
                     forwarded,
                 );
                 for fwd_slot in forwarded {
-                    let up_serial = SERIAL_COUNTER.next_serial();
-                    handle.up(
+                    let Some(&location) = self.niri.touch_gesture_points.get(&Some(fwd_slot))
+                    else {
+                        continue;
+                    };
+                    handle.motion(
                         self,
-                        &UpEvent {
+                        None,
+                        &TouchMotionEvent {
                             slot: fwd_slot,
-                            serial: up_serial,
+                            location,
                             time: evt.time(),
                         },
                     );
                 }
                 handle.cancel(self);
-                handle.frame(self);
             }
         }
 
