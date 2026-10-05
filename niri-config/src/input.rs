@@ -708,8 +708,8 @@ pub struct TouchscreenGesturesConfig {
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
 pub struct TouchpadGesturesConfig {
     /// Swipe commit gate: libinput delta units of centroid motion before
-    /// a swipe gesture latches. These units are acceleration-adjusted
-    /// and not directly comparable to touchscreen pixels. Default: 16.0.
+    /// a swipe gesture latches. These are unaccelerated deltas normalized
+    /// to 1000 dpi, not comparable to touchscreen pixels. Default: 16.0.
     #[knuffel(child, unwrap(argument))]
     pub swipe_trigger_distance: Option<f64>,
     /// Pinch commit gate: `|scale - 1.0|` must exceed this unitless scale

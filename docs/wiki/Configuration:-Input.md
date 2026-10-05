@@ -352,7 +352,7 @@ input {
 
 The `touchpad { gestures { } }` subblock contains tuning parameters for touchpad gesture recognition. Like touchscreen, the actual gesture binds (`TouchpadSwipe fingers=N direction="..."`, `TouchpadPinch fingers=N direction="..."`) live in the main `binds {}` block.
 
-- `swipe-trigger-distance <float>`: libinput delta units of centroid motion before a swipe gesture commits. These units are acceleration-adjusted and not directly comparable to touchscreen pixels. Default: `16.0`.
+- `swipe-trigger-distance <float>`: libinput delta units of finger motion before a swipe gesture commits. These are libinput's unaccelerated deltas, normalized to a 1000 dpi device, so one unit is nominally about 0.025 mm of travel and they are not comparable to touchscreen pixels. The default is under half a millimetre, so lower values feel the same; raise it into the tens or low hundreds to require a more deliberate swipe. Default: `16.0`.
 - `pinch-trigger-scale <float>`: `|scale - 1.0|` required before a `TouchpadPinch` bind fires. libinput normalizes pinch scale (1.0 = no change, 1.5 = 50% spread out, 0.5 = 50% spread in), so this is a unitless ratio and **not** directly comparable to the touchscreen `pinch-trigger-distance` (which is in pixels). Fires once per gesture when the threshold is crossed; direction is picked from the sign of the scale change. Default: `0.15`.
 
 Example:
