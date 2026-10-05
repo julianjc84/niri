@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use smithay::backend::input::{ButtonState, InputTime};
+use smithay::backend::input::{ButtonState, InputTime, TouchSlot};
 use smithay::desktop::Window;
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, GestureHoldBeginEvent,
@@ -43,6 +43,17 @@ pub struct MoveGrab {
     flick_x: SwipeTracker,
     flick_y: SwipeTracker,
     flick_last: Option<Point<f64, Logical>>,
+
+    // A second finger that landed during a touch move. Lifting it again as a
+    // tap toggles floating.
+    second_touch: Option<SecondTouch>,
+}
+
+/// Where and when a second finger landed during a touch move.
+struct SecondTouch {
+    slot: TouchSlot,
+    location: Point<f64, Logical>,
+    time: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +90,7 @@ impl MoveGrab {
             flick_x: SwipeTracker::new(),
             flick_y: SwipeTracker::new(),
             flick_last: None,
+            second_touch: None,
         })
     }
 
@@ -555,15 +567,18 @@ impl TouchGrab<State> for MoveGrab {
             return;
         }
 
-        // Second finger landed: cancel the move grab so the multi-finger
-        // gesture recognizer can take over. On mouse, the second button
-        // toggles floating (see `button` impl above), but on touch a new
-        // finger almost always means "this is becoming a multi-finger
-        // gesture" rather than a deliberate float toggle. The points are
-        // already tracked in `touch_gesture_points` (inserted in
-        // `on_touch_down` before this call), so the recognizer picks up
-        // seamlessly once the grab releases.
-        handle.unset_grab(self, data);
+        // A second finger may be a tap to toggle floating; `up` decides. A
+        // third finger makes this a compositor gesture, and the recognizer
+        // cancels the grab before that touch gets here.
+        if self.second_touch.is_some() {
+            handle.unset_grab(self, data);
+            return;
+        }
+        self.second_touch = Some(SecondTouch {
+            slot: event.slot,
+            location: event.location,
+            time: Duration::from_micros(event.time.micros()),
+        });
     }
 
     fn up(
@@ -579,6 +594,20 @@ impl TouchGrab<State> for MoveGrab {
             // must run before unset_grab, which ends the move in on_ungrab.
             self.try_flick_to_monitor(data);
             handle.unset_grab(self, data);
+            return;
+        }
+
+        // The second finger lifted: a quick, stationary tap toggles floating.
+        if self.second_touch.as_ref().map(|second| second.slot) != Some(event.slot) {
+            return;
+        }
+        let Some(second) = self.second_touch.take() else {
+            return;
+        };
+        let timeout_ms = data.niri.config.borrow().input.touchscreen.tap_timeout_ms();
+        let held = Duration::from_micros(event.time.micros()).saturating_sub(second.time);
+        if held.as_secs_f64() * 1000. <= timeout_ms && !self.on_toggle_floating(data) {
+            handle.unset_grab(self, data);
         }
     }
 
@@ -592,6 +621,20 @@ impl TouchGrab<State> for MoveGrab {
         handle.motion(data, None, event);
 
         if event.slot != self.start_data.unwrap_touch().slot {
+            // A second finger that drifts is no longer a tap.
+            if let Some(second) = &self.second_touch {
+                let drift = event.location - second.location;
+                let wobble = data
+                    .niri
+                    .config
+                    .borrow()
+                    .input
+                    .touchscreen
+                    .tap_wobble_threshold();
+                if second.slot == event.slot && drift.x.hypot(drift.y) > wobble {
+                    self.second_touch = None;
+                }
+            }
             return;
         }
 
