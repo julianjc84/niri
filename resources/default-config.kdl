@@ -35,6 +35,7 @@ input {
         // dwtp
         // drag false
         // drag-lock
+        // three-finger-drag
         natural-scroll
         // accel-speed 0.2
         // accel-profile "flat"

@@ -273,6 +273,10 @@ Settings specific to `touchpad`s:
 - `dwtp`: disable-when-trackpointing.
 - `drag`: <sup>Since: 25.05</sup> can be `true` or `false`, controls if tap-and-drag is enabled.
 - `drag-lock`: <sup>Since: 25.02</sup> if set, lifting the finger off for a short time while dragging will not drop the dragged item. See the [libinput documentation](https://wayland.freedesktop.org/libinput/doc/latest/tapping.html#tap-and-drag).
+- `three-finger-drag`: <sup>Since: next release</sup> enables libinput's [three-finger drag](https://wayland.freedesktop.org/libinput/doc/latest/drag-3fg.html): holding three fingers on the touchpad acts as a held left button, so moving them drags windows, text selections, or files without a physical press or tap-and-drag.
+  Use `three-finger-drag fingers=4` for four fingers instead (`fingers=` accepts `3` or `4`).
+  Requires libinput 1.27 or newer; older versions ignore the setting with a warning.
+  While enabled, libinput turns slow motion with that finger count into a drag, but a fast flick is still reported as a swipe gesture, so a `TouchpadSwipe` bind with the same `fingers=` value fires unpredictably. Move those binds to another finger count, for example rebind the default three-finger workspace and column swipes to `fingers=4`.
 - `pinch-sensitivity`: <sup>Since: next release</sup> scales the sensitivity of pinch gestures sent to applications.
   Values above `1.0` increase sensitivity, while values below `1.0` decrease it.
 - `tap-button-map`: can be `left-right-middle` or `left-middle-right`, controls which button corresponds to a two-finger tap and a three-finger tap.

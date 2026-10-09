@@ -4972,6 +4972,55 @@ fn hardcoded_overview_bind(raw: Keysym, mods: ModifiersState) -> Option<Bind> {
     })
 }
 
+// libinput's 3-finger-drag API is `@since 1.27`, but Ubuntu 24.04 (CI) ships 1.25, so the `input`
+// crate's `libinput_1_28` feature can't be enabled. Resolve the symbol at runtime instead, the same
+// way main.rs handles `wl_display_set_default_max_buffer_size`. `None` disables the drag.
+fn set_3fg_drag(device: &input::Device, fingers: Option<u8>) {
+    use std::ffi::{c_int, c_void};
+
+    use input::AsRaw;
+
+    // Values of `enum libinput_config_3fg_drag_state`: DISABLED, ENABLED_3FG, ENABLED_4FG.
+    let state: c_int = match fingers {
+        None => 0,
+        Some(3) => 1,
+        Some(_) => 2,
+    };
+
+    unsafe {
+        // RTLD_NOLOAD: only get a handle to the libinput already loaded by the input crate.
+        let lib = libc::dlopen(
+            c"libinput.so.10".as_ptr(),
+            libc::RTLD_LAZY | libc::RTLD_NOLOAD,
+        );
+        if lib.is_null() {
+            warn!("cannot configure three-finger-drag: libinput.so.10 is not loaded");
+            return;
+        }
+
+        let sym = libc::dlsym(lib, c"libinput_device_config_3fg_drag_set_enabled".as_ptr());
+        if sym.is_null() {
+            // Expected on libinput < 1.27; only worth a warning if the user asked for it.
+            if fingers.is_some() {
+                warn!("three-finger-drag requires libinput >= 1.27; ignoring");
+            }
+        } else {
+            let func: unsafe extern "C" fn(*mut c_void, c_int) -> c_int = std::mem::transmute(sym);
+            // Like the other libinput knobs, don't fail on UNSUPPORTED / INVALID from the device;
+            // just make it visible in the journal (0 = LIBINPUT_CONFIG_STATUS_SUCCESS).
+            let status = func(device.as_raw_mut().cast(), state);
+            if status != 0 {
+                debug!(
+                    "three-finger-drag not applied to {:?}: libinput status {status}",
+                    device.name()
+                );
+            }
+        }
+
+        libc::dlclose(lib);
+    }
+}
+
 pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::Device) {
     // According to Mutter code, this setting is specific to touchpads.
     let is_touchpad = device.config_tap_finger_count() > 0;
@@ -4992,6 +5041,7 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
         } else {
             input::DragLockState::Disabled
         });
+        set_3fg_drag(device, c.three_finger_drag.map(|d| d.fingers.0));
         let _ = device.config_scroll_set_natural_scroll_enabled(c.natural_scroll);
         let _ = device.config_accel_set_speed(c.accel_speed.0);
         let _ = device.config_left_handed_set(c.left_handed);

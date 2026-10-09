@@ -718,6 +718,7 @@ mod tests {
                     dwt
                     dwtp
                     drag true
+                    three-finger-drag fingers=4
                     click-method "clickfinger"
                     accel-speed 0.2
                     accel-profile "flat"
@@ -1045,6 +1046,13 @@ mod tests {
                         true,
                     ),
                     drag_lock: false,
+                    three_finger_drag: Some(
+                        ThreeFingerDrag {
+                            fingers: DragFingers(
+                                4,
+                            ),
+                        },
+                    ),
                     natural_scroll: false,
                     click_method: Some(
                         Clickfinger,

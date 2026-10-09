@@ -69,6 +69,8 @@ binds {
 
 `direction` names the physical direction your fingers travel, regardless of the touchpad's `natural-scroll` setting.
 
+Because the finger counts are configurable, you can free three fingers for libinput's [three-finger drag](https://wayland.freedesktop.org/libinput/doc/latest/drag-3fg.html) (macOS-style dragging without a physical press): enable `three-finger-drag` in the `input { touchpad { } }` block and move the workspace and column swipes to `fingers=4`. Do both together: a fast three-finger flick is still delivered as a swipe, so leaving `fingers=3` binds in place makes them fire only sometimes. See [Configuration: Input](./Configuration:-Input.md) for the setting.
+
 For the overview actions, moving in the bind's direction performs the action and moving back reverses it: `open-overview` opens, `close-overview` closes, and `toggle-overview` does whichever applies when the gesture starts. This holds for every continuous gesture family, on the touchpad and the touchscreen, and a bind's `natural-scroll=true` property does not change it.
 
 Tuning parameters for touchpad gesture recognition (`swipe-trigger-distance`, `pinch-trigger-scale`) live in the `input { touchpad { gestures { } } }` subblock — see [Configuration: Input](./Configuration:-Input.md#touchpad-gesture-tuning).

@@ -1,5 +1,8 @@
 use std::str::FromStr;
 
+use knuffel::decode::{Context, Kind};
+use knuffel::errors::DecodeError;
+use knuffel::traits::ErrorSpan;
 use miette::miette;
 use smithay::input::keyboard::XkbConfig;
 use smithay::reexports::input;
@@ -198,6 +201,8 @@ pub struct Touchpad {
     #[knuffel(child)]
     pub drag_lock: bool,
     #[knuffel(child)]
+    pub three_finger_drag: Option<ThreeFingerDrag>,
+    #[knuffel(child)]
     pub natural_scroll: bool,
     #[knuffel(child, unwrap(argument, str))]
     pub click_method: Option<ClickMethod>,
@@ -225,6 +230,64 @@ pub struct Touchpad {
     pub pinch_sensitivity: Option<FloatOrInt<0, 100>>,
     #[knuffel(child)]
     pub gestures: Option<TouchpadGesturesConfig>,
+}
+
+/// `three-finger-drag [fingers=3|4]`: libinput's native multi-finger drag.
+/// Holding N fingers on the pad emulates a held left button, so moving them
+/// drags without a physical press. Needs libinput >= 1.27 at runtime.
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ThreeFingerDrag {
+    #[knuffel(property, default)]
+    pub fingers: DragFingers,
+}
+
+/// Finger count for `three-finger-drag`. libinput supports exactly 3 or 4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DragFingers(pub u8);
+
+impl Default for DragFingers {
+    fn default() -> Self {
+        Self(3)
+    }
+}
+
+impl<S: ErrorSpan> knuffel::DecodeScalar<S> for DragFingers {
+    fn type_check(
+        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
+        ctx: &mut Context<S>,
+    ) {
+        if let Some(type_name) = &type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+    }
+
+    fn raw_decode(
+        value: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
+        ctx: &mut Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        match &**value {
+            knuffel::ast::Literal::Int(ref val) => match u8::try_from(val) {
+                Ok(n @ 3..=4) => Ok(Self(n)),
+                Ok(n) => {
+                    let msg = format!("fingers={n} out of range (valid range 3..=4)");
+                    ctx.emit_error(DecodeError::conversion(value, msg));
+                    Ok(Self::default())
+                }
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(value, e));
+                    Ok(Self::default())
+                }
+            },
+            _ => {
+                ctx.emit_error(DecodeError::scalar_kind(Kind::Int, value));
+                Ok(Self::default())
+            }
+        }
+    }
 }
 
 impl Touchpad {
@@ -894,6 +957,36 @@ mod tests {
             .map_err(miette::Report::new)
             .unwrap();
         Input::from_part(&part)
+    }
+
+    fn parse_fails(text: &str) -> bool {
+        knuffel::parse::<InputPart>("test.kdl", text).is_err()
+    }
+
+    #[test]
+    fn parse_three_finger_drag() {
+        let parsed = do_parse("touchpad { three-finger-drag; }");
+        assert_eq!(
+            parsed.touchpad.three_finger_drag,
+            Some(ThreeFingerDrag {
+                fingers: DragFingers(3)
+            })
+        );
+
+        let parsed = do_parse("touchpad { three-finger-drag fingers=4; }");
+        assert_eq!(
+            parsed.touchpad.three_finger_drag,
+            Some(ThreeFingerDrag {
+                fingers: DragFingers(4)
+            })
+        );
+
+        let parsed = do_parse("touchpad { tap; }");
+        assert_eq!(parsed.touchpad.three_finger_drag, None);
+
+        assert!(parse_fails("touchpad { three-finger-drag fingers=2; }"));
+        assert!(parse_fails("touchpad { three-finger-drag fingers=5; }"));
+        assert!(parse_fails("touchpad { three-finger-drag fingers=\"4\"; }"));
     }
 
     #[test]
